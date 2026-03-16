@@ -1,0 +1,6 @@
+node_modules/
+.env
+data/credentials.json
+data/token.json
+data/expenses.csv
+data/processed-emails.json
