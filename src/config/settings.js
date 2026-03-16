@@ -25,7 +25,16 @@ module.exports = {
   oauthRedirectPort: 3001,
 
   // CSV columns
-  csvHeaders: ['date', 'amount', 'currency', 'type', 'merchant', 'category', 'rawDescription', 'emailId'],
+  csvHeaders: [
+    'date',
+    'amount',
+    'currency',
+    'type',
+    'merchant',
+    'category',
+    'rawDescription',
+    'emailId',
+  ],
 
   // Log file for skipped and errored emails
   activityLogPath: path.join(DATA_DIR, 'activity.log'),

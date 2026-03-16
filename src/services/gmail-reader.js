@@ -8,9 +8,7 @@ const settings = require('../config/settings');
 async function resolveLabelId(gmail, labelName) {
   const res = await gmail.users.labels.list({ userId: 'me' });
   const labels = res.data.labels || [];
-  const match = labels.find(
-    (l) => l.name.toLowerCase() === labelName.toLowerCase()
-  );
+  const match = labels.find(l => l.name.toLowerCase() === labelName.toLowerCase());
   if (!match) {
     console.warn(`Warning: Gmail label "${labelName}" not found. Skipping label filter.`);
     return null;
@@ -44,7 +42,7 @@ async function fetchEmailIds(auth, since) {
   });
 
   const messages = res.data.messages || [];
-  return messages.map((m) => m.id);
+  return messages.map(m => m.id);
 }
 
 /**
@@ -64,7 +62,7 @@ async function fetchEmailBody(auth, messageId) {
 
   const message = res.data;
   const headers = message.payload.headers || [];
-  const subject = (headers.find((h) => h.name.toLowerCase() === 'subject') || {}).value || '';
+  const subject = (headers.find(h => h.name.toLowerCase() === 'subject') || {}).value || '';
 
   // Gmail internalDate is Unix milliseconds as a string
   const receivedAt = new Date(parseInt(message.internalDate, 10));

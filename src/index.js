@@ -67,7 +67,9 @@ async function main() {
   }
 
   const since = new Date(Date.now() - settings.fetchWindowHours * 60 * 60 * 1000);
-  console.log(`Fetching emails since ${since.toISOString()} (last ${settings.fetchWindowHours}h)...`);
+  console.log(
+    `Fetching emails since ${since.toISOString()} (last ${settings.fetchWindowHours}h)...`
+  );
 
   let emailIds;
   try {
@@ -80,7 +82,7 @@ async function main() {
   console.log(`Found ${emailIds.length} email(s) in window.`);
 
   const processedIds = loadProcessedIds();
-  const newIds = emailIds.filter((id) => !processedIds.includes(id));
+  const newIds = emailIds.filter(id => !processedIds.includes(id));
   console.log(`${newIds.length} new (unprocessed) email(s).`);
 
   if (newIds.length === 0) {
@@ -93,7 +95,7 @@ async function main() {
   // 1. Fetch all bodies in parallel
   console.log('Fetching email bodies in parallel...');
   const fetchResults = await Promise.all(
-    newIds.map(async (emailId) => {
+    newIds.map(async emailId => {
       try {
         const data = await fetchEmailBody(auth, emailId);
         return { emailId, ...data };
@@ -113,7 +115,7 @@ async function main() {
     }
   }
 
-  const toparse = fetchResults.filter((item) => !item.fetchError);
+  const toparse = fetchResults.filter(item => !item.fetchError);
 
   if (toparse.length === 0) {
     console.log('No emails to parse after fetch errors.');
@@ -164,7 +166,9 @@ async function main() {
         // Save state immediately after writing to CSV — prevents duplicates on crash
         saveProcessedId(emailId, processedIds);
 
-        console.log(`  [${emailId}] Logged: ${expense.date} | ${expense.type} | ${expense.currency} ${expense.amount} | ${expense.merchant} | ${category}`);
+        console.log(
+          `  [${emailId}] Logged: ${expense.date} | ${expense.type} | ${expense.currency} ${expense.amount} | ${expense.merchant} | ${category}`
+        );
         stats.parsed++;
       }
     }
@@ -180,7 +184,7 @@ async function main() {
   console.log('───────────────────────────────────────────────');
 }
 
-main().catch((err) => {
+main().catch(err => {
   console.error('Unexpected error:', err);
   process.exit(1);
 });

@@ -14,7 +14,7 @@ function escapeField(value) {
 }
 
 function rowToLine(row) {
-  return settings.csvHeaders.map((h) => escapeField(row[h])).join(',');
+  return settings.csvHeaders.map(h => escapeField(row[h])).join(',');
 }
 
 /**

@@ -5,7 +5,9 @@
       "WebFetch(domain:registry.npmjs.org)",
       "WebFetch(domain:ai.google.dev)",
       "WebFetch(domain:developers.google.com)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(find:*)",
+      "Bash(cd:*)"
     ]
   }
 }

@@ -14,7 +14,7 @@ async function authorize() {
   if (!fs.existsSync(settings.credentialsPath)) {
     throw new Error(
       `credentials.json not found at ${settings.credentialsPath}\n` +
-      'Download it from Google Cloud Console → APIs & Services → Credentials'
+        'Download it from Google Cloud Console → APIs & Services → Credentials'
     );
   }
 
@@ -93,7 +93,7 @@ function waitForAuthCode(port) {
       console.log(`Waiting for OAuth callback on port ${port}...`);
     });
 
-    server.on('error', (err) => {
+    server.on('error', err => {
       reject(new Error(`OAuth server error: ${err.message}`));
     });
 
@@ -109,10 +109,14 @@ async function openBrowser(url) {
   const { exec } = require('child_process');
   const platform = process.platform;
   const cmd =
-    platform === 'win32' ? `start "" "${url}"` :
-    platform === 'darwin' ? `open "${url}"` :
-    `xdg-open "${url}"`;
-  exec(cmd, (err) => { if (err) console.warn('Could not open browser:', err.message); });
+    platform === 'win32'
+      ? `start "" "${url}"`
+      : platform === 'darwin'
+        ? `open "${url}"`
+        : `xdg-open "${url}"`;
+  exec(cmd, err => {
+    if (err) console.warn('Could not open browser:', err.message);
+  });
 }
 
 module.exports = { authorize };
@@ -121,5 +125,8 @@ module.exports = { authorize };
 if (require.main === module) {
   authorize()
     .then(() => console.log('Authorization complete.'))
-    .catch((err) => { console.error(err.message); process.exit(1); });
+    .catch(err => {
+      console.error(err.message);
+      process.exit(1);
+    });
 }

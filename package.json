@@ -8,12 +8,16 @@
   },
   "scripts": {
     "start": "node src/index.js",
-    "auth": "node src/auth.js"
+    "auth": "node src/auth.js",
+    "format": "prettier --write \"src/**/*.js\""
   },
   "dependencies": {
-    "googleapis": "^171.0.0",
-    "cheerio": "^1.2.0",
     "@google/genai": "^1.0.0",
-    "dotenv": "^16.0.0"
+    "cheerio": "^1.2.0",
+    "dotenv": "^16.0.0",
+    "googleapis": "^171.0.0"
+  },
+  "devDependencies": {
+    "prettier": "^3.8.1"
   }
 }
