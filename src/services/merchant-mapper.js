@@ -29,7 +29,9 @@ function saveMapping(data) {
 function getCategory(merchantName) {
   const map = loadMapping();
   const key = (merchantName || '').toLowerCase().trim();
-  return map[key] || 'Uncategorized';
+  if (map[key] !== undefined) return map[key];
+  addMapping(key, 'Uncategorized');
+  return 'Uncategorized';
 }
 
 /**

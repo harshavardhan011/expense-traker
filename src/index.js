@@ -4,7 +4,7 @@ const { authorize } = require('./auth');
 const { fetchEmailIds, fetchEmailBody } = require('./services/gmail-reader');
 const { parseExpensesBatch } = require('./services/gemini-parser');
 const { getCategory } = require('./services/merchant-mapper');
-const { appendExpense, initCsv } = require('./services/csv-writer');
+const { appendExpense, initCsv, recategorizeUncategorized } = require('./services/csv-writer');
 const settings = require('./config/settings');
 
 // ─── First-run setup ──────────────────────────────────────────────────────────
@@ -86,7 +86,11 @@ async function main() {
   console.log(`${newItems.length} new (unprocessed) email(s).`);
 
   if (newItems.length === 0) {
-    console.log('No new transactions found. Exiting.');
+    console.log('No new transactions found.');
+    const recategorized = await recategorizeUncategorized();
+    if (recategorized > 0) {
+      console.log(`Re-categorized ${recategorized} previously Uncategorized rows.`);
+    }
     return;
   }
 
@@ -183,11 +187,16 @@ async function main() {
     }
   }
 
+  const recategorized = await recategorizeUncategorized();
+
   // ─── Summary ───────────────────────────────────────────────────────────────
   console.log('\n─── Summary ───────────────────────────────────');
   console.log(`  Transactions logged : ${stats.parsed}`);
   console.log(`  Non-transaction emails skipped : ${stats.skipped}`);
   console.log(`  Parse / fetch errors : ${stats.errors}`);
+  if (recategorized > 0) {
+    console.log(`  Re-categorized   : ${recategorized} previously Uncategorized rows`);
+  }
   console.log(`  CSV : ${settings.csvFilePath}`);
   console.log(`  Log : ${settings.activityLogPath}`);
   console.log('───────────────────────────────────────────────');
