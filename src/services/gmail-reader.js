@@ -1,4 +1,5 @@
 const { google } = require('googleapis');
+const { load: cheerioLoad } = require('cheerio');
 const settings = require('../config/settings');
 
 /**
@@ -72,6 +73,12 @@ async function fetchEmailBody(auth, messageId) {
   return { body, receivedAt, subject };
 }
 
+function stripHtml(html) {
+  const $ = cheerioLoad(html);
+  $('style, script').remove();
+  return $.text().replace(/\s+/g, ' ').trim();
+}
+
 /**
  * Walk the MIME tree to extract body text.
  * Priority: text/plain > text/html (decoded from HTML to plain text).
@@ -85,9 +92,9 @@ function extractBody(part) {
     return decodeBase64(part.body.data);
   }
 
-  // For text/html, decode but return as-is (gemini-parser will handle it)
+  // For text/html, strip tags to plain text before returning
   if (part.mimeType === 'text/html' && part.body && part.body.data) {
-    return decodeBase64(part.body.data);
+    return stripHtml(decodeBase64(part.body.data));
   }
 
   // Walk nested parts (multipart/alternative, multipart/mixed, etc.)

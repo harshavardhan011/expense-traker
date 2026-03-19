@@ -121,14 +121,20 @@ async function main() {
     console.log('No emails to parse after fetch errors.');
   } else {
     // 2. Batch parse (chunked by geminiBatchSize)
+    const emailBodies = new Map(toparse.map(item => [item.emailId, item]));
     const batchSize = settings.geminiBatchSize;
     const chunks = [];
     for (let i = 0; i < toparse.length; i += batchSize) {
       chunks.push(toparse.slice(i, i + batchSize));
     }
-
     for (const chunk of chunks) {
+      // DEBUG: log stripped bodies before sending to Gemini
+      for (const email of chunk) {
+        console.log(`\n=== [${email.emailId}] Subject: "${email.subject}" ===`);
+        console.log(email.body);
+      }
       const results = await parseExpensesBatch(chunk);
+      // const results = [];
 
       // 3. Process results
       for (const { emailId, subject, expense, geminiError } of results) {
@@ -142,7 +148,8 @@ async function main() {
 
         if (!expense) {
           console.log(`  [${emailId}] Skipped (not a transaction): "${subject}"`);
-          writeLog('SKIP', emailId, subject || '', 'not_a_transaction');
+          const bodySnippet = (emailBodies.get(emailId)?.body || '').slice(0, 300);
+          writeLog('SKIP', emailId, subject || '', `not_a_transaction body="${bodySnippet}"`);
           stats.skipped++;
           saveProcessedId(emailId, processedIds);
           continue;
@@ -158,6 +165,7 @@ async function main() {
           merchant: expense.merchant,
           category,
           rawDescription: expense.rawDescription,
+          availableCreditLimit: expense.availableCreditLimit,
           emailId,
         };
 

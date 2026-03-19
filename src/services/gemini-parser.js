@@ -1,5 +1,4 @@
 const { GoogleGenAI } = require('@google/genai');
-const { load: cheerioLoad } = require('cheerio');
 const settings = require('../config/settings');
 
 let aiClient = null;
@@ -15,16 +14,6 @@ function getClient() {
 }
 
 /**
- * Strip HTML tags to plain text for cleaner Gemini input.
- * Only applied when body looks like HTML.
- */
-function maybeStripHtml(body) {
-  if (!body.trimStart().startsWith('<')) return body;
-  const $ = cheerioLoad(body);
-  return $.text().replace(/\s+/g, ' ').trim();
-}
-
-/**
  * Parse a batch of emails in a single Gemini call.
  * @param {Array<{ emailId: string, body: string, receivedAt: Date, subject: string }>} emails
  * @returns {Array<{ emailId: string, subject: string, expense: object|null }>}
@@ -35,7 +24,7 @@ async function parseExpensesBatch(emails) {
   // Strip HTML and build per-email sections
   const prepared = emails.map(e => ({
     ...e,
-    plainText: maybeStripHtml(e.body || ''),
+    plainText: e.body || '',
     fallbackDate: e.receivedAt.toISOString().split('T')[0],
   }));
 
@@ -48,12 +37,18 @@ async function parseExpensesBatch(emails) {
   const prompt = `You are a financial data extractor. Process each email below and return a JSON array — one object per email, in the same order.
 For each email return either:
 { "amount": <number>, "currency": "<3-letter ISO code>", "type": "<DR or CR>",
-  "merchant": "<string or null>", "date": "<YYYY-MM-DD>", "rawDescription": "<string>" }
+  "merchant": "<string or null>", "date": "<YYYY-MM-DD>",
+  "rawDescription": "<one-line summary: card/account, amount, merchant, date — no limit figures>",
+  "availableCreditLimit": <number or null> }
 OR if not a transaction email:
-{ "notATransaction": true, "rawDescription": "<string>" }
+{ "notATransaction": true, "rawDescription": "<full original text as-is>" }
 
 Rules:
-- type is "DR" if money left the account (debit/paid/withdrawn/spent/purchase), "CR" if money entered (credit/received/deposited/refund/cashback)
+- type is "DR" if money left the account (debit/paid/withdrawn/spent/purchase), "CR" if money entered (credit/received/deposited/refund/reversal/cashback/chargeback)
+- Reversals, refunds, cashbacks, and chargebacks ARE transactions — always return a transaction object for them (type "CR"), never mark them as notATransaction
+- merchant may be null for bank-originated reversals (no merchant involved)
+- rawDescription for transactions must be a concise one-line summary (card/account, amount, merchant, date). Never include credit limit, debit limit, or balance figures in rawDescription.
+- availableCreditLimit: extract the available credit limit number (as a plain number, no currency symbol) if the email mentions it; otherwise null.
 - Use these fallback dates when date is ambiguous or missing:
 ${fallbackLines}
 Return ONLY a valid JSON array, no markdown, no explanation.
@@ -104,6 +99,7 @@ ${emailSections}`;
         merchant: item.merchant || 'Unknown',
         date: item.date || e.fallbackDate,
         rawDescription: item.rawDescription || '',
+        availableCreditLimit: item.availableCreditLimit ?? null,
       },
     };
   });
