@@ -1,6 +1,5 @@
 const { google } = require('googleapis');
 const { load: cheerioLoad } = require('cheerio');
-const settings = require('../config/settings');
 
 /**
  * Resolve a Gmail label name to its ID.
@@ -18,32 +17,39 @@ async function resolveLabelId(gmail, labelName) {
 }
 
 /**
- * Fetch unread bank-alert email IDs since the given cutoff time.
+ * Fetch unread bank-alert email IDs since the given cutoff time, across multiple labels.
  * @param {object} auth - OAuth2 client
  * @param {Date} since - fetch emails after this date
- * @returns {string[]} list of message IDs
+ * @param {string[]} labelNames - Gmail label names to scan
+ * @returns {{ id: string, label: string }[]} list of message objects with label
  */
-async function fetchEmailIds(auth, since) {
+async function fetchEmailIds(auth, since, labelNames) {
   const gmail = google.gmail({ version: 'v1', auth });
 
   // Gmail `after:` expects Unix seconds, not milliseconds
   const afterSeconds = Math.floor(since.getTime() / 1000);
+  const query = `after:${afterSeconds}`;
 
-  let query = `after:${afterSeconds}`;
+  const labelResolutions = await Promise.all(
+    labelNames.map(async name => ({ name, id: await resolveLabelId(gmail, name) }))
+  );
 
-  const labelId = await resolveLabelId(gmail, settings.gmailLabel);
-  const labelIds = labelId ? [labelId] : [];
-  // If label not found, we don't add it — avoids returning ALL messages
+  // First-label-wins deduplication across labels
+  const emailLabelMap = new Map();
+  for (const { name, id } of labelResolutions) {
+    if (id === null) continue;
+    const res = await gmail.users.messages.list({
+      userId: 'me',
+      q: query,
+      labelIds: [id],
+      maxResults: 100,
+    });
+    for (const m of (res.data.messages || [])) {
+      if (!emailLabelMap.has(m.id)) emailLabelMap.set(m.id, name);
+    }
+  }
 
-  const res = await gmail.users.messages.list({
-    userId: 'me',
-    q: query,
-    ...(labelIds.length > 0 ? { labelIds } : {}),
-    maxResults: 100, // pagination out of scope for v1
-  });
-
-  const messages = res.data.messages || [];
-  return messages.map(m => m.id);
+  return Array.from(emailLabelMap.entries()).map(([id, label]) => ({ id, label }));
 }
 
 /**

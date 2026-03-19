@@ -69,6 +69,7 @@ ${emailSections}`;
     // Return nulls for all emails in this batch so caller can handle errors
     return prepared.map(e => ({
       emailId: e.emailId,
+      label: e.label,
       subject: e.subject,
       expense: null,
       geminiError: err.message,
@@ -81,16 +82,17 @@ ${emailSections}`;
     if (!Array.isArray(parsed)) throw new Error('Response is not an array');
   } catch {
     console.error('Failed to parse Gemini batch response as JSON:', raw?.slice(0, 200));
-    return prepared.map(e => ({ emailId: e.emailId, subject: e.subject, expense: null }));
+    return prepared.map(e => ({ emailId: e.emailId, label: e.label, subject: e.subject, expense: null }));
   }
 
   return prepared.map((e, i) => {
     const item = parsed[i];
     if (!item || item.notATransaction || !item.amount || !item.currency) {
-      return { emailId: e.emailId, subject: e.subject, expense: null };
+      return { emailId: e.emailId, label: e.label, subject: e.subject, expense: null };
     }
     return {
       emailId: e.emailId,
+      label: e.label,
       subject: e.subject,
       expense: {
         amount: item.amount,

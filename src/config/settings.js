@@ -8,7 +8,10 @@ module.exports = {
   geminiModel: 'gemini-2.5-flash',
 
   // Gmail settings
-  gmailLabel: process.env.GMAIL_LABEL || 'bank-alerts',
+  gmailLabels: (process.env.GMAIL_LABELS || process.env.GMAIL_LABEL || 'bank-alerts')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean),
   fetchWindowHours: parseInt(process.env.FETCH_WINDOW_HOURS || '24', 10),
   geminiBatchSize: parseInt(process.env.GEMINI_BATCH_SIZE || '20', 10),
 
@@ -26,6 +29,7 @@ module.exports = {
 
   // CSV columns
   csvHeaders: [
+    'label',
     'date',
     'amount',
     'currency',

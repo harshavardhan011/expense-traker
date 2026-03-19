@@ -7,7 +7,11 @@
       "WebFetch(domain:developers.google.com)",
       "WebFetch(domain:github.com)",
       "Bash(find:*)",
-      "Bash(cd:*)"
+      "Bash(cd:*)",
+      "Bash(py --version)",
+      "Read(//c/Users/Harshj/AppData/Local/Programs/**)",
+      "Read(//c/Users/Harshj/AppData/Local/Microsoft/WindowsApps/**)",
+      "Bash(bash --version 2>/dev/null | head -1; bash -c 'echo \"bash inline works\"' 2>/dev/null)"
     ]
   }
 }

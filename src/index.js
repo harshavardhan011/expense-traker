@@ -71,21 +71,21 @@ async function main() {
     `Fetching emails since ${since.toISOString()} (last ${settings.fetchWindowHours}h)...`
   );
 
-  let emailIds;
+  let emailItems;
   try {
-    emailIds = await fetchEmailIds(auth, since);
+    emailItems = await fetchEmailIds(auth, since, settings.gmailLabels);
   } catch (err) {
     console.error('Failed to fetch email list:', err.message);
     process.exit(1);
   }
 
-  console.log(`Found ${emailIds.length} email(s) in window.`);
+  console.log(`Found ${emailItems.length} email(s) in window.`);
 
   const processedIds = loadProcessedIds();
-  const newIds = emailIds.filter(id => !processedIds.includes(id));
-  console.log(`${newIds.length} new (unprocessed) email(s).`);
+  const newItems = emailItems.filter(item => !processedIds.includes(item.id));
+  console.log(`${newItems.length} new (unprocessed) email(s).`);
 
-  if (newIds.length === 0) {
+  if (newItems.length === 0) {
     console.log('No new transactions found. Exiting.');
     return;
   }
@@ -95,14 +95,14 @@ async function main() {
   // 1. Fetch all bodies in parallel
   console.log('Fetching email bodies in parallel...');
   const fetchResults = await Promise.all(
-    newIds.map(async emailId => {
+    newItems.map(async ({ id: emailId, label }) => {
       try {
         const data = await fetchEmailBody(auth, emailId);
-        return { emailId, ...data };
+        return { emailId, label, ...data };
       } catch (err) {
         console.error(`  [${emailId}] Failed to fetch body: ${err.message}`);
         writeLog('ERROR', emailId, '', `fetch_failed: ${err.message}`);
-        return { emailId, fetchError: err.message };
+        return { emailId, label, fetchError: err.message };
       }
     })
   );
@@ -137,7 +137,7 @@ async function main() {
       // const results = [];
 
       // 3. Process results
-      for (const { emailId, subject, expense, geminiError } of results) {
+      for (const { emailId, label, subject, expense, geminiError } of results) {
         if (geminiError) {
           console.error(`  [${emailId}] Gemini error: ${geminiError}`);
           writeLog('ERROR', emailId, subject || '', `gemini_failed: ${geminiError}`);
@@ -158,6 +158,7 @@ async function main() {
         const category = getCategory(expense.merchant);
 
         const row = {
+          label,
           date: expense.date,
           amount: expense.amount,
           currency: expense.currency,
