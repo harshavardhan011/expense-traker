@@ -38,6 +38,8 @@ module.exports = {
     'category',
     'rawDescription',
     'availableCreditLimit',
+    'accountType',
+    'accountLast4',
     'emailId',
   ],
 

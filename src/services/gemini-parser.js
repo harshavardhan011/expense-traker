@@ -39,7 +39,9 @@ For each email return either:
 { "amount": <number>, "currency": "<3-letter ISO code>", "type": "<DR or CR>",
   "merchant": "<string or null>", "date": "<YYYY-MM-DD>",
   "rawDescription": "<one-line summary: card/account, amount, merchant, date — no limit figures>",
-  "availableCreditLimit": <number or null> }
+  "availableCreditLimit": <number or null>,
+  "accountType": "<credit_card|debit_card|upi|netbanking|bank_transfer|null>",
+  "accountLast4": "<last 4 digits of card/account number as a string, or null>" }
 OR if not a transaction email:
 { "notATransaction": true, "rawDescription": "<full original text as-is>" }
 
@@ -49,6 +51,8 @@ Rules:
 - merchant may be null for bank-originated reversals (no merchant involved)
 - rawDescription for transactions must be a concise one-line summary (card/account, amount, merchant, date). Never include credit limit, debit limit, or balance figures in rawDescription.
 - availableCreditLimit: extract the available credit limit number (as a plain number, no currency symbol) if the email mentions it; otherwise null.
+- accountType: classify as one of "credit_card", "debit_card", "upi", "netbanking", "bank_transfer". Use null if cannot be determined.
+- accountLast4: the last 4 digits of the card/account number as a string (e.g. "4321"). Use null if not visible.
 - Use these fallback dates when date is ambiguous or missing:
 ${fallbackLines}
 Return ONLY a valid JSON array, no markdown, no explanation.
@@ -102,6 +106,8 @@ ${emailSections}`;
         date: item.date || e.fallbackDate,
         rawDescription: item.rawDescription || '',
         availableCreditLimit: item.availableCreditLimit ?? null,
+        accountType: item.accountType || null,
+        accountLast4: item.accountLast4 ? String(item.accountLast4) : null,
       },
     };
   });

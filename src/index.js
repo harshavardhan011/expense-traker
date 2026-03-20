@@ -171,6 +171,8 @@ async function main() {
           category,
           rawDescription: expense.rawDescription,
           availableCreditLimit: expense.availableCreditLimit,
+          accountType: expense.accountType,
+          accountLast4: expense.accountLast4,
           emailId,
         };
 
