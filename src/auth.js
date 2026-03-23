@@ -33,11 +33,21 @@ async function authorize() {
     oAuth2Client.setCredentials(token);
     // Refresh if expired
     if (token.expiry_date && token.expiry_date < Date.now()) {
-      const { credentials: newToken } = await oAuth2Client.refreshAccessToken();
-      fs.writeFileSync(settings.tokenPath, JSON.stringify(newToken, null, 2));
-      oAuth2Client.setCredentials(newToken);
+      try {
+        const { credentials: newToken } = await oAuth2Client.refreshAccessToken();
+        fs.writeFileSync(settings.tokenPath, JSON.stringify(newToken, null, 2));
+        oAuth2Client.setCredentials(newToken);
+      } catch (err) {
+        if (err.message?.includes('invalid_grant')) {
+          console.warn('Saved token is no longer valid — starting fresh OAuth flow...');
+          fs.unlinkSync(settings.tokenPath);
+          // fall through to interactive auth below
+        } else {
+          throw err;
+        }
+      }
     }
-    return oAuth2Client;
+    if (fs.existsSync(settings.tokenPath)) return oAuth2Client;
   }
 
   // First-time auth flow
@@ -74,6 +84,7 @@ function getFreePort() {
 
 function waitForAuthCode(port) {
   return new Promise((resolve, reject) => {
+    let timeoutId;
     const server = http.createServer((req, res) => {
       const { query } = url.parse(req.url, true);
       if (query.error) {
@@ -84,6 +95,7 @@ function waitForAuthCode(port) {
       }
       if (query.code) {
         res.end('<h2>Authentication successful! You can close this tab.</h2>');
+        clearTimeout(timeoutId);
         server.close();
         resolve(query.code);
       }
@@ -98,7 +110,7 @@ function waitForAuthCode(port) {
     });
 
     // Timeout after 2 minutes
-    setTimeout(() => {
+    timeoutId = setTimeout(() => {
       server.close();
       reject(new Error('OAuth timeout — no response within 2 minutes'));
     }, 120_000);
