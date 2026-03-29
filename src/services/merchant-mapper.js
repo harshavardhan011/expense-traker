@@ -3,6 +3,13 @@ const settings = require('../config/settings');
 
 let mapping = null;
 
+// If merchant string is "upi-id@bank name", return just "name".
+// If only a VPA with no name follows, return unchanged.
+function normalizeUpiMerchant(name) {
+  const m = name.match(/^[\w.]+@\w+\s+(.+)$/);
+  return m ? m[1] : name;
+}
+
 function loadMapping() {
   if (mapping) return mapping;
   try {
@@ -28,7 +35,7 @@ function saveMapping(data) {
  */
 function getCategory(merchantName) {
   const map = loadMapping();
-  const key = (merchantName || '').toLowerCase().trim();
+  const key = normalizeUpiMerchant((merchantName || '').toLowerCase().trim());
   if (map[key] !== undefined) return map[key];
   addMapping(key, 'Uncategorized');
   return 'Uncategorized';
@@ -42,7 +49,7 @@ function getCategory(merchantName) {
  */
 function addMapping(merchantName, category) {
   const map = loadMapping();
-  const key = merchantName.toLowerCase().trim();
+  const key = normalizeUpiMerchant(merchantName.toLowerCase().trim());
   map[key] = category;
   saveMapping(map);
 }

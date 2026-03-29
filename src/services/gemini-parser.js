@@ -49,6 +49,7 @@ Rules:
 - type is "DR" if money left the account (debit/paid/withdrawn/spent/purchase), "CR" if money entered (credit/received/deposited/refund/reversal/cashback/chargeback)
 - Reversals, refunds, cashbacks, and chargebacks ARE transactions — always return a transaction object for them (type "CR"), never mark them as notATransaction
 - merchant may be null for bank-originated reversals (no merchant involved)
+- For UPI transactions, merchant should be the recipient's name only (e.g. "Ajinath Kasule"), NOT the UPI VPA (e.g. "q650936481@ybl"). If only a VPA is available and no name can be found, use the VPA.
 - rawDescription for transactions must be a concise one-line summary (card/account, amount, merchant, date). Never include credit limit, debit limit, or balance figures in rawDescription.
 - availableCreditLimit: extract the available credit limit number (as a plain number, no currency symbol) if the email mentions it; otherwise null.
 - accountType: classify as one of "credit_card", "debit_card", "upi", "netbanking", "bank_transfer". Use null if cannot be determined.
