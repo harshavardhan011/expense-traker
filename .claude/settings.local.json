@@ -14,5 +14,8 @@
       "Bash(bash --version 2>/dev/null | head -1; bash -c 'echo \"bash inline works\"' 2>/dev/null)",
       "Bash(ls:*)"
     ]
-  }
+  },
+  "enabledMcpjsonServers": [
+    "supabase"
+  ]
 }
