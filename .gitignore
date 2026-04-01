@@ -5,3 +5,5 @@ data/token.json
 data/expenses.csv
 data/processed-emails.json
 data/activity.log
+.claude/settings.local.json
+.mcp.json

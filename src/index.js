@@ -3,54 +3,80 @@ const path = require('path');
 const { authorize } = require('./auth');
 const { fetchEmailIds, fetchEmailBody } = require('./services/gmail-reader');
 const { parseExpensesBatch } = require('./services/gemini-parser');
-const { getCategory } = require('./services/merchant-mapper');
-const { appendExpense, initCsv, recategorizeUncategorized } = require('./services/csv-writer');
+const { getCategory } = require('./services/db-merchant-mapper');
+const { insertExpense, recategorizeUncategorized } = require('./services/db-writer');
+const supabase = require('./services/db');
 const settings = require('./config/settings');
 
 // ─── First-run setup ──────────────────────────────────────────────────────────
 
 function initDataDirectory() {
+  // Only ensure the data/ dir exists for OAuth credential files — all data now lives in Supabase
   if (!fs.existsSync(settings.dataDir)) {
     fs.mkdirSync(settings.dataDir, { recursive: true });
     console.log('Created data/ directory.');
   }
-
-  if (!fs.existsSync(settings.processedEmailsPath)) {
-    fs.writeFileSync(settings.processedEmailsPath, '[]');
-  }
-
-  if (!fs.existsSync(settings.merchantMappingPath)) {
-    fs.writeFileSync(settings.merchantMappingPath, '{}');
-  }
-
-  initCsv();
 }
 
-// ─── Activity log ─────────────────────────────────────────────────────────────
+// ─── Activity log → Supabase ──────────────────────────────────────────────────
 
-function writeLog(level, emailId, subject, detail) {
-  const ts = new Date().toISOString();
-  const line = `[${ts}] [${level}] emailId=${emailId} subject="${subject}" ${detail}\n`;
-  fs.appendFileSync(settings.activityLogPath, line);
-}
-
-// ─── State: processed email IDs ───────────────────────────────────────────────
-
-function loadProcessedIds() {
-  try {
-    const raw = fs.readFileSync(settings.processedEmailsPath, 'utf8');
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed;
-  } catch {
-    console.warn('processed-emails.json is missing or corrupted. Starting fresh.');
-    return [];
+async function writeLog(level, emailId, subject, detail) {
+  const { error } = await supabase.from('activity_logs').insert({
+    level,
+    email_id: emailId,
+    subject: subject || '',
+    detail,
+  });
+  if (error) {
+    // Non-fatal: log to stderr but don't crash the run
+    console.error(`[writeLog] DB insert failed: ${error.message}`);
   }
 }
 
-function saveProcessedId(id, processedIds) {
-  processedIds.push(id);
-  fs.writeFileSync(settings.processedEmailsPath, JSON.stringify(processedIds, null, 2));
+// ─── State: processed email IDs → Supabase ────────────────────────────────────
+
+async function pruneProcessedIds() {
+  const cutoff = new Date(Date.now() - settings.processedEmailsRetentionHours * 60 * 60 * 1000);
+  const { count, error } = await supabase
+    .from('processed_emails')
+    .delete({ count: 'exact' })
+    .lt('processed_at', cutoff.toISOString());
+  if (error) console.warn('[pruneProcessedIds] failed (non-fatal):', error.message);
+  else if (count > 0) console.log(`Pruned ${count} old processed_emails entries.`);
+}
+
+async function getLastRunCutoff() {
+  const { data } = await supabase
+    .from('processed_emails')
+    .select('processed_at')
+    .order('processed_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (!data) return null; // empty table → caller falls back to FETCH_WINDOW_HOURS
+  return new Date(
+    new Date(data.processed_at).getTime() - settings.overlapBufferMinutes * 60 * 1000
+  );
+}
+
+async function loadProcessedIds(since) {
+  const windowStart = new Date(since.getTime() - settings.overlapBufferMinutes * 60 * 1000);
+  const { data, error } = await supabase
+    .from('processed_emails')
+    .select('email_id')
+    .gte('processed_at', windowStart.toISOString());
+  if (error) {
+    console.warn('Could not load processed emails from DB:', error.message);
+    return new Set();
+  }
+  return new Set((data || []).map(r => r.email_id));
+}
+
+async function saveProcessedId(id) {
+  const { error } = await supabase.from('processed_emails').insert({ email_id: id });
+  // Ignore duplicate key errors (email already marked processed)
+  if (error && !error.message.includes('duplicate')) {
+    console.error(`[saveProcessedId] failed for ${id}: ${error.message}`);
+  }
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -66,9 +92,16 @@ async function main() {
     process.exit(1);
   }
 
-  const since = new Date(Date.now() - settings.fetchWindowHours * 60 * 60 * 1000);
+  await pruneProcessedIds();
+
+  const lastRunCutoff = await getLastRunCutoff();
+  const since = lastRunCutoff
+    ? lastRunCutoff
+    : new Date(Date.now() - settings.fetchWindowHours * 60 * 60 * 1000);
   console.log(
-    `Fetching emails since ${since.toISOString()} (last ${settings.fetchWindowHours}h)...`
+    lastRunCutoff
+      ? `Fetching emails since last run (${since.toISOString()}, with ${settings.overlapBufferMinutes}m overlap)...`
+      : `Fetching emails since ${since.toISOString()} (fallback: last ${settings.fetchWindowHours}h)...`
   );
 
   let emailItems;
@@ -81,8 +114,8 @@ async function main() {
 
   console.log(`Found ${emailItems.length} email(s) in window.`);
 
-  const processedIds = loadProcessedIds();
-  const newItems = emailItems.filter(item => !processedIds.includes(item.id));
+  const processedIds = await loadProcessedIds(since);
+  const newItems = emailItems.filter(item => !processedIds.has(item.id));
   console.log(`${newItems.length} new (unprocessed) email(s).`);
 
   if (newItems.length === 0) {
@@ -105,7 +138,7 @@ async function main() {
         return { emailId, label, ...data };
       } catch (err) {
         console.error(`  [${emailId}] Failed to fetch body: ${err.message}`);
-        writeLog('ERROR', emailId, '', `fetch_failed: ${err.message}`);
+        await writeLog('ERROR', emailId, '', `fetch_failed: ${err.message}`);
         return { emailId, label, fetchError: err.message };
       }
     })
@@ -115,7 +148,7 @@ async function main() {
   for (const item of fetchResults) {
     if (item.fetchError) {
       stats.errors++;
-      saveProcessedId(item.emailId, processedIds);
+      await saveProcessedId(item.emailId);
     }
   }
 
@@ -138,28 +171,27 @@ async function main() {
         console.log(email.body);
       }
       const results = await parseExpensesBatch(chunk);
-      // const results = [];
 
       // 3. Process results
       for (const { emailId, label, subject, expense, geminiError } of results) {
         if (geminiError) {
           console.error(`  [${emailId}] Gemini error: ${geminiError}`);
-          writeLog('ERROR', emailId, subject || '', `gemini_failed: ${geminiError}`);
+          await writeLog('ERROR', emailId, subject || '', `gemini_failed: ${geminiError}`);
           stats.errors++;
-          saveProcessedId(emailId, processedIds);
+          await saveProcessedId(emailId);
           continue;
         }
 
         if (!expense) {
           console.log(`  [${emailId}] Skipped (not a transaction): "${subject}"`);
           const bodySnippet = (emailBodies.get(emailId)?.body || '').slice(0, 300);
-          writeLog('SKIP', emailId, subject || '', `not_a_transaction body="${bodySnippet}"`);
+          await writeLog('SKIP', emailId, subject || '', `not_a_transaction body="${bodySnippet}"`);
           stats.skipped++;
-          saveProcessedId(emailId, processedIds);
+          await saveProcessedId(emailId);
           continue;
         }
 
-        const category = getCategory(expense.merchant);
+        const category = await getCategory(expense.merchant);
 
         const row = {
           label,
@@ -176,10 +208,10 @@ async function main() {
           emailId,
         };
 
-        appendExpense(row);
+        await insertExpense(row);
 
-        // Save state immediately after writing to CSV — prevents duplicates on crash
-        saveProcessedId(emailId, processedIds);
+        // Save state immediately after DB write — prevents duplicates on crash
+        await saveProcessedId(emailId);
 
         console.log(
           `  [${emailId}] Logged: ${expense.date} | ${expense.type} | ${expense.currency} ${expense.amount} | ${expense.merchant} | ${category}`
@@ -199,8 +231,8 @@ async function main() {
   if (recategorized > 0) {
     console.log(`  Re-categorized   : ${recategorized} previously Uncategorized rows`);
   }
-  console.log(`  CSV : ${settings.csvFilePath}`);
-  console.log(`  Log : ${settings.activityLogPath}`);
+  console.log(`  DB : ${settings.supabaseUrl}`);
+  console.log(`  Log : activity_logs table in Supabase`);
   console.log('───────────────────────────────────────────────');
 }
 

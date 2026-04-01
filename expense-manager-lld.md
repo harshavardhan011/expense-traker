@@ -2,7 +2,9 @@
 
 ## 1. Overview
 
-A Node.js CLI tool that reads bank payment alert emails from Gmail, parses them using Google Gemini Flash API (free tier), auto-categorizes using a merchant mapping JSON, and logs expenses to a local CSV file. Designed to run manually from a laptop — daily or weekly.
+A Node.js CLI tool that reads bank payment alert emails from Gmail, parses them using Google Gemini Flash API, auto-categorizes using a merchant mapping table in Supabase, and stores all expense data to a PostgreSQL database (Supabase). Designed to run manually from a laptop — daily or weekly.
+
+All persistent state (expenses, processed email IDs, merchant mappings, activity logs) lives in Supabase. Only OAuth credential files remain local.
 
 ---
 
@@ -15,24 +17,28 @@ A Node.js CLI tool that reads bank payment alert emails from Gmail, parses them 
 [Gmail API] ──► Fetch emails from configured labels (last N hours)
         │
         ▼
-[Dedup Filter] ──► Skip already-processed emails (tracked by Gmail message ID)
-        │
+[Dedup Filter] ──► Skip already-processed emails
+        │           (SELECT from processed_emails table)
         ▼
 [Gemini Parser] ──► Send raw email text to Gemini Flash API (free tier)
-        │            Prompt: "Extract amount, merchant, date, type, reference as JSON"
-        │            Returns: { amount, merchant, date, type, bank, reference }
+        │            Prompt: "Extract amount, merchant, date, type as JSON"
+        │            Returns: { amount, merchant, date, type, currency, ... }
         ▼
-[Merchant Mapper] ──► Lookup merchant in merchant-mapping.json
-        │               ├── Found: attach alias + category
-        │               └── Not found: mark as "Uncategorized"
+[Merchant Mapper] ──► SELECT from merchant_mappings table (in-process cache)
+        │               ├── Found: return category
+        │               └── Not found: INSERT 'Uncategorized', return it
         ▼
-[CSV Writer] ──► Append row to expenses.csv
+[DB Writer] ──► UPSERT row into expenses table (Supabase)
         │
         ▼
-[Terminal Summary] ──► Print what was logged + list unknowns
+[Save State] ──► INSERT email_id into processed_emails table
         │
         ▼
-[Save State] ──► Update processed-emails.json
+[Terminal Summary] ──► Print what was logged
+        │
+        ▼
+[Recategorize] ──► UPDATE expenses SET category=... WHERE category='Uncategorized'
+                    using current merchant_mappings
 ```
 
 ---
@@ -42,22 +48,26 @@ A Node.js CLI tool that reads bank payment alert emails from Gmail, parses them 
 ```
 expense-manager/
 ├── src/
-│   ├── index.js                # Main entry point — orchestrates the full flow
-│   ├── auth.js                 # Google OAuth2 authentication
+│   ├── index.js                    # Main entry point — orchestrates the full flow
+│   ├── auth.js                     # Google OAuth2 authentication
 │   ├── config/
-│   │   └── settings.js         # All configuration in one place
+│   │   └── settings.js             # All configuration in one place
 │   └── services/
-│       ├── gmail-reader.js     # Gmail API integration
-│       ├── gemini-parser.js    # Gemini Flash API for parsing emails
-│       ├── merchant-mapper.js  # JSON-based merchant lookup
-│       └── csv-writer.js       # Append transactions to CSV
+│       ├── gmail-reader.js         # Gmail API integration
+│       ├── gemini-parser.js        # Gemini Flash API for parsing emails
+│       ├── db.js                   # Supabase client singleton
+│       ├── db-writer.js            # Insert/upsert expenses into Supabase
+│       ├── db-merchant-mapper.js   # DB-backed merchant lookup + in-process cache
+│       ├── csv-writer.js           # [DEPRECATED — replaced by db-writer.js]
+│       └── merchant-mapper.js      # [DEPRECATED — replaced by db-merchant-mapper.js]
+├── scripts/
+│   └── migrate-to-supabase.js      # One-time migration: CSV/JSON files → Supabase
 ├── data/
-│   ├── merchant-mapping.json   # Merchant → alias + category map
-│   ├── processed-emails.json   # Array of processed Gmail message IDs
-│   └── expenses.csv            # The expense log (auto-created)
-├── credentials.json            # Google OAuth creds (user provides)
-├── token.json                  # Auto-generated after first auth
+│   ├── credentials.json            # Google OAuth creds (user provides, never in DB)
+│   └── token.json                  # Auto-generated after first auth (never in DB)
 ├── package.json
+├── .env
+├── .env.example
 ├── .gitignore
 └── README.md
 ```
@@ -73,19 +83,22 @@ Exports a single config object:
 ```javascript
 module.exports = {
   // Gmail
-  gmailLabels: ['BankAlerts'],     // Gmail label names to scan
-  fetchWindowHours: 24,            // How far back to fetch (24 = daily, 168 = weekly)
+  gmailLabels: ['bank-alerts'],        // comma-separated from GMAIL_LABELS env var
+  fetchWindowHours: 24,                // from FETCH_WINDOW_HOURS env var
 
   // Gemini
-  geminiApiKey: process.env.GEMINI_API_KEY || '',  // From env variable
-  geminiModel: 'gemini-2.0-flash',                 // Free tier model
+  geminiApiKey: process.env.GEMINI_API_KEY,
+  geminiModel: 'gemini-2.5-flash',
+  geminiBatchSize: 20,                 // emails per Gemini call
 
-  // File paths
-  csvFilePath: './data/expenses.csv',
-  merchantMappingPath: './data/merchant-mapping.json',
-  processedEmailsPath: './data/processed-emails.json',
-  credentialsPath: './credentials.json',
-  tokenPath: './token.json',
+  // Supabase
+  supabaseUrl: process.env.SUPABASE_URL,
+  supabaseAnonKey: process.env.SUPABASE_ANON_KEY,
+
+  // Local-only paths (OAuth credentials — never go to DB)
+  dataDir: './data',
+  credentialsPath: './data/credentials.json',
+  tokenPath: './data/token.json',
 };
 ```
 
@@ -97,260 +110,178 @@ Handles Google OAuth2 for Gmail API (read-only scope).
 - If `token.json` exists and is valid → return auth client
 - If token is expired → refresh it automatically
 - If no token → open browser for OAuth consent, save token after approval
-- Callback server on `http://localhost:3001/callback`
+- Redirect URI: `http://127.0.0.1:<ephemeral_port>/callback` (port chosen at runtime)
 
 **Scopes needed:**
 - `https://www.googleapis.com/auth/gmail.readonly`
 
-**Dependencies:** `googleapis`
-
 ### 4.3 `src/services/gmail-reader.js`
 
-**Class: `GmailReader`**
+**Functions: `fetchEmailIds(auth, since, labels)` and `fetchEmailBody(auth, emailId)`**
 
-Constructor takes `auth` (OAuth2 client).
-
-**Method: `fetchPaymentEmails()`**
-- Iterates over each label in `settings.gmailLabels`
-- For each label:
-  - Resolve label name → label ID via `users.labels.list`
-  - Query: `after:{epochSeconds}` where epoch = now - fetchWindowHours
-  - Fetch full message for each result
-- Extract from each email:
-  - `id` (Gmail message ID — used for dedup)
-  - `subject` (from headers)
-  - `from` (from headers)
-  - `date` (from headers)
-  - `body` (decoded from payload)
-- Body extraction: handle both `text/plain` and `text/html` parts. For HTML, strip tags to get plain text (use `cheerio`).
-- Returns: `Array<{ id, subject, from, date, body }>`
+- Resolves each label name → label ID at runtime via `users.labels.list`
+- Supports multiple labels (comma-separated in `GMAIL_LABELS`); dedup is first-label-wins
+- `after:` query uses Unix seconds
+- Body extraction: walks MIME tree, prefers `text/plain`, falls back to `text/html`
+- Gmail returns URL-safe base64 (`-`→`+`, `_`→`/` before `Buffer.from`)
 
 ### 4.4 `src/services/gemini-parser.js`
 
-**This is the core module that replaces all bank-specific regex parsers.**
+**Function: `parseExpensesBatch(emails)`**
 
-**Function: `parseEmails(emails)`**
+Sends emails in batches to Gemini Flash (`gemini-2.5-flash`), `responseMimeType: 'application/json'`, `temperature: 0`. Each email is truncated to 1500 chars. Returns `null` expense for non-transaction emails.
 
-Takes an array of email objects, returns parsed transactions.
-
-**Strategy: One Gemini call per email** (not batched — simpler error handling, and 10 emails is trivial on free tier).
-
-**Gemini API call:**
-```
-POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={API_KEY}
-{
-  "contents": [{
-    "parts": [{ "text": "<the prompt below>" }]
-  }],
-  "generationConfig": {
-    "responseMimeType": "application/json",
-    "temperature": 0
-  }
-}
-```
-
-**Prompt template for each email:**
-
-```
-You are a transaction parser. Extract payment details from this Indian bank email alert.
-
-Return ONLY a JSON object with these exact fields:
-{
-  "amount": <number, the debited amount in INR>,
-  "merchant": "<string, the merchant/person name who received payment>",
-  "date": "<string, transaction date in YYYY-MM-DD format>",
-  "type": "<string, one of: UPI, Credit Card, UPI/Credit Card, Debit Card, NEFT, IMPS, RTGS, Other>",
-  "bank": "<string, bank name like HDFC Bank, ICICI Bank, Standard Chartered>",
-  "reference": "<string, transaction reference or UTR number, empty string if not found>"
-}
-
-Rules:
-- "type" detection: If both "Credit Card" and "UPI" appear → "UPI/Credit Card". If only "Credit Card" → "Credit Card". If only "UPI" → "UPI". Check for NEFT/IMPS/RTGS/Debit Card/ATM keywords.
-- "merchant" should be the human-readable name, not the VPA/UPI ID.
-- If the email is a credit/refund (not a debit), return: { "skip": true }
-- If you cannot parse the email, return: { "error": "reason" }
-
-Email text:
----
-{EMAIL_BODY}
----
-```
-
-**Response handling:**
-- Parse JSON from Gemini response: `response.candidates[0].content.parts[0].text`
-- If `skip: true` → ignore this email (it's a credit, not a debit)
-- If `error` present → log warning, skip this email
-- Validate: amount must be > 0, merchant must be non-empty
-- If JSON parsing fails → log warning, skip email
-
-**Rate limiting:** Gemini free tier allows 15 RPM (requests per minute). For 10 emails, no throttling needed. If future usage grows, add a 4-second delay between calls.
-
-**Timeout:** 15 seconds per request.
-
-**Returns:** `Array<{ amount, merchant, date, type, bank, reference, emailId }>`
-
-### 4.5 `src/services/merchant-mapper.js`
-
-**Class: `MerchantMapper`**
-
-Loads `merchant-mapping.json` on construction.
-
-**Mapping JSON structure:**
-```json
-{
-  "karan sharma": { "alias": "Nashta Center", "category": "Food/Breakfast" },
-  "yuvraj saudagar patange": { "alias": "Nashta Center", "category": "Food/Breakfast" },
-  "swiggy": { "alias": "Swiggy", "category": "Food/Delivery" },
-  "amazon": { "alias": "Amazon", "category": "Shopping/Online" }
-}
-```
-
-**Method: `categorize(transaction)`**
-
-Matching logic (case-insensitive):
-1. Exact match: `normalized_merchant === key`
-2. Partial match: `normalized_merchant.includes(key) || key.includes(normalized_merchant)`
-3. No match → return with `category: "Uncategorized"`, `merchantAlias: ""`
-
-Returns:
+**Returned expense object:**
 ```javascript
 {
-  ...transaction,
-  merchantAlias: "Nashta Center",   // or "" if unmapped
-  category: "Food/Breakfast",       // or "Uncategorized"
-  mapped: true                      // or false
+  amount: number,
+  currency: string,           // 'INR', 'USD', etc.
+  type: 'DR' | 'CR',
+  merchant: string,
+  date: string,               // 'YYYY-MM-DD'
+  rawDescription: string,
+  availableCreditLimit: number | null,
+  accountType: string | null, // 'credit_card' | 'debit_card' | 'upi' | 'netbanking' | 'bank_transfer'
+  accountLast4: string | null
 }
 ```
 
-**Method: `addMapping(rawMerchant, alias, category)`**
-- Adds to in-memory map
-- Saves to JSON file
-- Used for future: when UI is built, this method is called from the API
+### 4.5 `src/services/db.js`
 
-### 4.6 `src/services/csv-writer.js`
+Supabase client singleton:
 
-**Function: `appendTransactions(transactions)`**
-
-**CSV columns (in order):**
-```
-Date, Amount, Merchant (Raw), Merchant (Alias), Category, Payment Type, Bank, Reference
+```javascript
+const { createClient } = require('@supabase/supabase-js');
+const supabase = createClient(settings.supabaseUrl, settings.supabaseAnonKey);
+module.exports = supabase;
 ```
 
-**Behavior:**
-- If `expenses.csv` doesn't exist → create with header row
-- If exists → append rows (no header)
-- Use proper CSV escaping (fields with commas wrapped in quotes)
-- Amount as plain number (no ₹ symbol — easier for formulas)
-- Date in `YYYY-MM-DD` format
+All other services import this module rather than creating their own clients.
 
-**No external dependency needed** — just `fs` with manual CSV formatting. Or use a tiny lib like `csv-stringify` if preferred.
+### 4.6 `src/services/db-writer.js`
 
-### 4.7 `src/index.js`
+**`insertExpense(row)`**
+- UPSERT into `expenses` with `onConflict: 'email_id'` — idempotent
+- Maps camelCase JS fields to snake_case DB columns
 
-**Main orchestrator.**
+**`recategorizeUncategorized()`**
+- Fetches all expenses where `category = 'Uncategorized'`
+- Fetches all merchant_mappings where `category != 'Uncategorized'`
+- UPDATEs matching expenses in a loop
+- Returns count of rows updated
+
+### 4.7 `src/services/db-merchant-mapper.js`
+
+**`getCategory(merchantName)`**
+- Normalizes merchant name (lowercase, trim, UPI VPA stripping)
+- Checks in-process cache first
+- On cache miss: SELECT from `merchant_mappings`
+- If not found in DB: INSERT 'Uncategorized', return 'Uncategorized'
+- Cache is loaded once per run and updated on writes
+
+**`addMapping(merchantName, category)`**
+- UPSERT into `merchant_mappings` with `onConflict: 'merchant'`
+- Updates in-process cache
+
+### 4.8 `src/index.js`
+
+Main orchestrator:
 
 ```
-async function run() {
-  1. Call authenticate() → get auth client
-  2. Create GmailReader(auth) → call fetchPaymentEmails()
-  3. Load processedEmailIds from processed-emails.json
-  4. Filter out already-processed emails
-  5. If no new emails → print "No new transactions" → exit
-  6. Call parseEmails(newEmails) via gemini-parser
-  7. Create MerchantMapper → categorize each transaction
-  8. Call appendTransactions() via csv-writer
-  9. Save updated processedEmailIds
-  10. Print terminal summary:
-      - List of logged transactions (amount, alias, category)
-      - List of unknown merchants with a hint:
-        "Unknown: YUVRAJ SAUDAGAR PATANGE (₹272) — add to data/merchant-mapping.json"
+async function main() {
+  1. initDataDirectory()         — ensure data/ dir exists for OAuth files
+  2. authorize()                 — get Gmail auth client
+  3. fetchEmailIds()             — get email IDs from last N hours
+  4. loadProcessedIds()          — SELECT email_id FROM processed_emails → Set
+  5. filter new emails
+  6. fetchEmailBody() (parallel) — fetch raw email bodies
+  7. parseExpensesBatch()        — Gemini batch parse
+  8. For each result:
+     a. writeLog() if error/skip → INSERT into activity_logs
+     b. getCategory()            → SELECT from merchant_mappings
+     c. insertExpense()          → UPSERT into expenses
+     d. saveProcessedId()        → INSERT into processed_emails
+  9. recategorizeUncategorized() — bulk UPDATE expenses
+  10. print summary
 }
 ```
 
 ---
 
-## 5. Data Files
+## 5. Database Tables (Supabase / PostgreSQL)
 
-### 5.1 `data/merchant-mapping.json`
+### `expenses`
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | BIGSERIAL PK | Auto-increment |
+| `email_id` | TEXT UNIQUE | Gmail message ID — dedup key |
+| `label` | TEXT | Gmail label name |
+| `date` | DATE | Transaction date |
+| `amount` | NUMERIC(12,2) | Transaction amount |
+| `currency` | CHAR(3) | ISO code, default 'INR' |
+| `type` | CHAR(2) | 'DR' (debit) or 'CR' (credit) |
+| `merchant` | TEXT | Merchant name |
+| `category` | TEXT | From merchant_mappings |
+| `raw_description` | TEXT | One-line summary from Gemini |
+| `available_credit_limit` | NUMERIC(12,2) | nullable |
+| `account_type` | TEXT | credit_card/debit_card/upi/etc |
+| `account_last4` | TEXT | Last 4 digits, nullable |
+| `created_at` | TIMESTAMPTZ | Auto-set |
 
-Pre-seeded with common Indian merchants:
+### `processed_emails`
+| Column | Type | Notes |
+|--------|------|-------|
+| `email_id` | TEXT PK | Gmail message ID |
+| `processed_at` | TIMESTAMPTZ | Auto-set |
 
-```json
-{
-  "swiggy": { "alias": "Swiggy", "category": "Food/Delivery" },
-  "zomato": { "alias": "Zomato", "category": "Food/Delivery" },
-  "amazon": { "alias": "Amazon", "category": "Shopping/Online" },
-  "flipkart": { "alias": "Flipkart", "category": "Shopping/Online" },
-  "uber": { "alias": "Uber", "category": "Transport/Cab" },
-  "ola": { "alias": "Ola", "category": "Transport/Cab" },
-  "rapido": { "alias": "Rapido", "category": "Transport/Auto" },
-  "dmart": { "alias": "DMart", "category": "Groceries" },
-  "bigbasket": { "alias": "BigBasket", "category": "Groceries" },
-  "blinkit": { "alias": "Blinkit", "category": "Groceries" },
-  "zepto": { "alias": "Zepto", "category": "Groceries" },
-  "netflix": { "alias": "Netflix", "category": "Subscriptions" },
-  "spotify": { "alias": "Spotify", "category": "Subscriptions" }
-}
-```
+### `merchant_mappings`
+| Column | Type | Notes |
+|--------|------|-------|
+| `merchant` | TEXT PK | Lowercase normalized merchant name |
+| `category` | TEXT | e.g. 'Shopping', 'Transport', 'Uncategorized' |
+| `updated_at` | TIMESTAMPTZ | Auto-set |
 
-User manually adds entries like:
-```json
-"karan sharma": { "alias": "Nashta Center", "category": "Food/Breakfast" },
-"yuvraj saudagar patange": { "alias": "Nashta Center", "category": "Food/Breakfast" }
-```
-
-### 5.2 `data/processed-emails.json`
-
-Simple array of Gmail message IDs:
-```json
-["msg_abc123", "msg_def456", "msg_ghi789"]
-```
-
-### 5.3 `data/expenses.csv`
-
-Example output:
-```csv
-Date,Amount,Merchant (Raw),Merchant (Alias),Category,Payment Type,Bank,Reference
-2026-03-01,272,YUVRAJ SAUDAGAR PATANGE,Nashta Center,Food/Breakfast,UPI/Credit Card,HDFC Bank,293773719007
-2026-03-01,499,SWIGGY,Swiggy,Food/Delivery,UPI,ICICI Bank,293773812345
-2026-03-01,1500,SOME NEW MERCHANT,,Uncategorized,Credit Card,HDFC Bank,293774000001
-```
+### `activity_logs`
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | BIGSERIAL PK | Auto-increment |
+| `logged_at` | TIMESTAMPTZ | Auto-set |
+| `level` | TEXT | 'SKIP' or 'ERROR' |
+| `email_id` | TEXT | Gmail message ID |
+| `subject` | TEXT | Email subject |
+| `detail` | TEXT | Reason / error message |
 
 ---
 
 ## 6. Prerequisites & Setup
 
-### 6.1 Gemini API Setup
-```
-1. Go to https://aistudio.google.com/apikey
-2. Click "Create API Key"
-3. Copy the key
-4. Set it as environment variable:
-   export GEMINI_API_KEY=your_key_here
-   (Add to .bashrc / .zshrc for persistence)
-```
-Free tier limits (more than enough):
-- 15 requests per minute
-- 1 million tokens per day
-- No billing account needed
+### 6.1 Gemini API
+1. Go to aistudio.google.com/apikey → Create API Key
+2. Set `GEMINI_API_KEY` in `.env`
 
-### 6.2 Google Cloud Setup (Gmail API only)
-1. Go to console.cloud.google.com
-2. Create project → Enable "Gmail API"
-3. Credentials → Create OAuth 2.0 Client ID (Desktop App type)
-4. Download JSON → rename to `credentials.json` → place in project root
+Free tier: 15 RPM, 1M tokens/day — more than enough.
 
-### 6.3 Node.js Dependencies
+### 6.2 Google Cloud (Gmail API)
+1. console.cloud.google.com → Enable Gmail API
+2. Credentials → Create OAuth 2.0 Client ID (Desktop App)
+3. Download JSON → save as `data/credentials.json`
+
+### 6.3 Supabase
+1. Sign up at supabase.com → New project (free M0 equivalent, 500 MB)
+2. SQL Editor → run CREATE TABLE statements (see README)
+3. Project Settings → API → copy URL and anon key into `.env`
+
+### 6.4 Node.js Dependencies
 ```json
 {
   "dependencies": {
     "googleapis": "^131.0.0",
-    "cheerio": "^1.0.0-rc.12"
+    "@google/genai": "latest",
+    "@supabase/supabase-js": "^2.x",
+    "dotenv": "latest"
   }
 }
 ```
-
-Note: No express, no cors, no heavy libs — MVP is minimal. `cheerio` is only needed if bank emails are HTML (most are). Gemini API is called via native `fetch` (Node 18+), no SDK needed.
 
 ---
 
@@ -358,84 +289,52 @@ Note: No express, no cors, no heavy libs — MVP is minimal. `cheerio` is only n
 
 | Scenario | Behavior |
 |----------|----------|
-| Gemini API key missing/invalid | Print: "GEMINI_API_KEY not set. Get one from https://aistudio.google.com/apikey" → exit |
-| Gemini returns unparseable response | Log warning with email subject → skip that email → continue |
-| Gemini returns `{ skip: true }` | Silently skip (it's a credit/refund email) |
-| Gemini rate limit hit (15 RPM) | Wait 4 seconds → retry once → if still fails, skip with warning |
-| Gmail label not found | Print warning → skip that label → continue with others |
-| Gmail API auth expired | Auto-refresh token. If refresh fails → re-run `node src/auth.js` |
-| CSV file locked (open in Excel) | Print error → suggest closing the file → exit |
-| No new emails found | Print "No new transactions found" → exit cleanly |
-| Duplicate email (already processed) | Silently skip via processed-emails.json check |
+| `SUPABASE_URL` / `SUPABASE_ANON_KEY` missing | `db.js` throws at import time — process exits before main runs |
+| Supabase insert fails | Throws; caught by main → logged to stderr, email marked processed |
+| Gemini API key missing/invalid | Error logged → process exits |
+| Gemini returns unparseable response | Logged to `activity_logs` as ERROR → skip email → continue |
+| Gmail label not found | Returns `null` ID → skips that label, continues with others |
+| Gmail auth expired | Auto-refresh. If refresh fails → re-run `npm run auth` |
+| Duplicate email (already processed) | `processed_emails` check skips it before any API call |
+| `activity_logs` insert fails | Non-fatal — logged to stderr, run continues |
 
 ---
 
 ## 8. Terminal Output Example
 
 ```
-💰 Expense Manager — Daily Sync
-================================
+Fetching emails since 2026-03-29T00:00:00.000Z (last 24h)...
+Found 6 email(s) in window.
+2 new (unprocessed) email(s).
+Fetching email bodies in parallel...
 
-🔐 Authenticating... ✓
-📧 Fetching emails from label "BankAlerts"...
-   Found 6 emails, 4 are new
+=== [19d013f11c7e3cd2] Subject: "Alert: ICICI Bank Credit Card" ===
+...
 
-🤖 Parsing with Gemini Flash...
-   ✓ Parsed 4/4 transactions
+  [19d013f11c7e3cd2] Logged: 2026-03-29 | DR | INR 1206 | REL RETAIL LTD TR | Shopping
+  [19ce126f16e9f28c] Skipped (not a transaction): "OTP For online Ecom Transaction"
 
-🗂️  Categorizing...
-   ✓ Auto-categorized: 3
-   ❓ Unknown merchants: 1
-
-📋 Logged Transactions:
-──────────────────────────────────────────────────
-  ₹272.00    │ Nashta Center        │ Food/Breakfast     │ UPI/Credit Card
-  ₹499.00    │ Swiggy               │ Food/Delivery      │ UPI
-  ₹150.00    │ Jio Recharge         │ Bills/Mobile       │ UPI
-
-⚠️  Unknown Merchants (add to data/merchant-mapping.json):
-──────────────────────────────────────────────────
-  ₹1,500.00  │ SOME NEW MERCHANT    │ Uncategorized
-  Hint: Add → "some new merchant": { "alias": "???", "category": "???" }
-
-✅ Done! 4 transactions saved to data/expenses.csv
+─── Summary ───────────────────────────────────
+  Transactions logged : 1
+  Non-transaction emails skipped : 1
+  Parse / fetch errors : 0
+  DB : https://xxxxxxxxxxxx.supabase.co
+  Log : activity_logs table in Supabase
+───────────────────────────────────────────────
 ```
 
 ---
 
-## 9. Future Enhancements (NOT in v1)
+## 9. Future Enhancements
 
-These are scoped out of MVP but documented for later:
-
-- **v2: Web UI** — Express server + React frontend for categorizing unknowns visually
-- **v3: Google Sheets sync** — dual-write to local CSV + Google Sheets
-- **v4: Telegram bot** — trigger sync + categorize unknowns via chat
-- **v5: Monthly reports** — category-wise totals, trends, budget alerts
-- **v6: Auto-schedule** — cron job / system scheduler instead of manual trigger
-- **v7: Refund tracking** — handle credit emails, net out refunds
-
----
-
-## 10. Sample Bank Email Formats (Reference)
-
-### HDFC — UPI via Credit Card
-```
-Dear Customer, Rs.272.00 has been debited from your HDFC Bank RuPay Credit Card XX8735
-to Q051879601@ybl YUVRAJ SAUDAGAR PATANGE on 01-03-26.
-Your UPI transaction reference number is 293773719007.
-```
-
-### HDFC — Regular UPI (expected format)
-```
-Dear Customer, Rs.150.00 has been debited from a/c **1234
-to VPA merchant@upi MERCHANT NAME on 01-03-26.
-UPI Ref No. 293773812345.
-```
-
-### ICICI — Credit Card (expected format)
-```
-Your ICICI Bank Credit Card XX5678 has been used for a transaction of
-INR 1,500.00 at MERCHANT NAME on 01-03-2026. Ref No: 123456789.
-```
-
-(Add more samples as you discover them — the Ollama prompt handles any format)
+- **Dashboard** — query Supabase via its auto-generated REST API or JS SDK from any frontend (React, Next.js). No backend needed — Supabase handles auth + API.
+- **Accounting** — window functions in PostgreSQL make running totals, period-over-period comparisons, and budget tracking straightforward:
+  ```sql
+  SELECT date, amount,
+    SUM(amount) OVER (PARTITION BY DATE_TRUNC('month', date) ORDER BY date) AS running_monthly_total
+  FROM expenses WHERE type = 'DR';
+  ```
+- **Web UI for recategorization** — edit `merchant_mappings` rows in Supabase Table Editor or build a small React form that calls the Supabase JS SDK directly.
+- **Auto-schedule** — cron job or Windows Task Scheduler to run `npm start` daily.
+- **Telegram bot** — trigger sync + review unknowns via chat.
+- **Refund tracking** — net out CR rows against DR rows for the same merchant.
