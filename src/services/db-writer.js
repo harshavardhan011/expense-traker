@@ -1,11 +1,13 @@
 const supabase = require('./db');
+const { recordExpenseImpact } = require('./account-manager');
 
 /**
  * Upsert a single expense row into the `expenses` table.
  * Uses email_id as the conflict key — safe to call multiple times.
+ * After upsert, updates the linked account balance (if any).
  */
 async function insertExpense(row) {
-  const { error } = await supabase.from('expenses').upsert(
+  const { data, error } = await supabase.from('expenses').upsert(
     {
       email_id: row.emailId,
       label: row.label,
@@ -21,8 +23,15 @@ async function insertExpense(row) {
       account_last4: row.accountLast4 ?? null,
     },
     { onConflict: 'email_id' }
-  );
+  ).select('id').single();
   if (error) throw new Error(`insertExpense failed: ${error.message}`);
+
+  // Update linked account balance (non-blocking — warns if no account found)
+  try {
+    await recordExpenseImpact(row, data.id);
+  } catch (err) {
+    console.warn(`[insertExpense] account balance update failed (non-fatal): ${err.message}`);
+  }
 }
 
 /**

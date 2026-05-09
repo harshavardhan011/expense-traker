@@ -7,7 +7,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 npm install          # install dependencies
 npm run auth         # one-time Gmail OAuth flow — creates data/token.json
-npm start            # fetch + parse emails → append to data/expenses.csv
+npm start            # fetch + parse emails → Supabase + update account balances
+npm run cli -- account list            # list all accounts with balances
+npm run cli -- account add             # add a new account (interactive)
+npm run cli -- account add-funds 1482  # add funds to savings/salary account
+npm run cli -- account pay 8735        # record a credit card bill payment
+npm run cli -- account history 8735    # show transaction history
+npm run cli -- account backfill 8735   # recalculate balance from existing expenses
 ```
 
 No test runner or linter is configured.
@@ -26,7 +32,9 @@ Gmail API → email IDs → filter duplicates → fetch bodies (parallel) → Ge
 3. `services/gemini-parser.js` — Uses `@google/genai` SDK (`GoogleGenAI`), model `gemini-2.5-flash`, `responseMimeType: 'application/json'`, `temperature: 0`. Emails are batched (controlled by `GEMINI_BATCH_SIZE`, default 20). Each email is truncated to 1500 chars before being sent. Returns `null` expense for non-transaction emails. Uses Gmail `receivedAt` as date fallback.
 4. `services/merchant-mapper.js` — Looks up `data/merchant-mapping.json`. Both key and query are `.toLowerCase().trim()` before matching. Mapping is lazy-loaded and cached in-process.
 5. `services/csv-writer.js` — Appends one row per transaction. `initCsv()` writes header if file missing.
-6. `src/index.js` — State saved **per-email** immediately after CSV write (not at end of run), so a crash mid-run doesn't cause duplicates on restart.
+6. `services/account-manager.js` — Account CRUD, balance updates, and expense-to-account linking. Uses `update_account_balance` Postgres RPC for atomic balance mutations. Finds accounts by `(account_type, account_last4)` with last4-only fallback for UPI/netbanking expenses linking to savings accounts.
+7. `src/index.js` — State saved **per-email** immediately after DB write (not at end of run), so a crash mid-run doesn't cause duplicates on restart.
+8. `src/cli.js` — Interactive CLI for account management (list, add, add-funds, pay, history, backfill). Uses Node.js `readline`.
 
 ## Configuration
 
@@ -54,6 +62,24 @@ Key `.env` variables:
 | `activity.log` | Append-only log of skipped and errored emails |
 
 **To re-process emails:** clear `processed-emails.json` to `[]` and increase `FETCH_WINDOW_HOURS`.
+
+## Supabase tables
+
+| Table | Purpose |
+|-------|---------|
+| `expenses` | Transaction records (one row per parsed email) |
+| `processed_emails` | Deduplication state for email processing |
+| `merchant_mappings` | Merchant → category lookup |
+| `activity_logs` | Audit trail for skipped/errored emails |
+| `accounts` | Bank accounts and credit cards with current balances |
+| `account_transactions` | Audit trail for every account balance change |
+
+**Accounts balance semantics:**
+- **Credit cards**: `balance` = unbilled amount (positive = you owe). DR increases, CR/payment decreases.
+- **Savings/salary**: `balance` = available funds (positive = you have). DR decreases, CR/manual credit increases.
+- Linking: expenses match accounts by `(account_type, account_last4)` with last4-only fallback.
+- Idempotent: `account_transactions.expense_id` prevents double-counting on re-runs.
+- Atomic: `update_account_balance` RPC function handles UPDATE + INSERT in one transaction.
 
 ## Key design constraints
 
