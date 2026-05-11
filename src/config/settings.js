@@ -16,10 +16,10 @@ module.exports = {
   geminiBatchSize: parseInt(process.env.GEMINI_BATCH_SIZE || '20', 10),
   // Minutes subtracted from last processed_at to absorb clock skew / in-flight emails
   overlapBufferMinutes: parseInt(process.env.OVERLAP_BUFFER_MINUTES || '10', 10),
-  // How long to retain rows in processed_emails; must be >= fetchWindowHours
+  // How long to retain rows in processed_emails; must be >= fetchWindowHours + overlapBufferMinutes/60
   processedEmailsRetentionHours: parseInt(
     process.env.PROCESSED_EMAILS_RETENTION_HOURS ||
-    String(parseInt(process.env.FETCH_WINDOW_HOURS || '24', 10) * 2),
+    String(parseInt(process.env.FETCH_WINDOW_HOURS || '24', 10) + 24),
     10
   ),
 

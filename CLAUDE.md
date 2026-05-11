@@ -65,6 +65,8 @@ Key `.env` variables:
 
 ## Supabase tables
 
+Schema is defined in `db/schema.sql` (single source of truth). If `DATABASE_URL` is set, all tables and the `update_account_balance` RPC are created automatically on `npm start` using `CREATE TABLE IF NOT EXISTS` / `CREATE OR REPLACE FUNCTION` — idempotent, safe to run every time.
+
 | Table | Purpose |
 |-------|---------|
 | `expenses` | Transaction records (one row per parsed email) |

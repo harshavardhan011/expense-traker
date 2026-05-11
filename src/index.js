@@ -1,11 +1,12 @@
 const fs = require('fs');
 const path = require('path');
 const { authorize } = require('./auth');
-const { fetchEmailIds, fetchEmailBody } = require('./services/gmail-reader');
+const { fetchEmailIds, fetchEmailBody, resolveLabelName } = require('./services/gmail-reader');
 const { parseExpensesBatch } = require('./services/gemini-parser');
 const { getCategory } = require('./services/db-merchant-mapper');
 const { insertExpense, recategorizeUncategorized } = require('./services/db-writer');
 const supabase = require('./services/db');
+const { bootstrapSchema } = require('./services/db-bootstrap');
 const settings = require('./config/settings');
 
 // ─── First-run setup ──────────────────────────────────────────────────────────
@@ -84,6 +85,13 @@ async function saveProcessedId(id) {
 async function main() {
   initDataDirectory();
 
+  try {
+    await bootstrapSchema();
+  } catch (err) {
+    console.error('Schema bootstrap failed:', err.message);
+    process.exit(1);
+  }
+
   let auth;
   try {
     auth = await authorize();
@@ -92,31 +100,42 @@ async function main() {
     process.exit(1);
   }
 
+  if (settings.processedEmailsRetentionHours < settings.fetchWindowHours) {
+    console.warn(
+      `[WARN] PROCESSED_EMAILS_RETENTION_HOURS (${settings.processedEmailsRetentionHours}h) < ` +
+      `FETCH_WINDOW_HOURS (${settings.fetchWindowHours}h) — dedup state may expire before the ` +
+      `fetch window closes, risking reprocessed emails.`
+    );
+  }
+
   await pruneProcessedIds();
 
   const lastRunCutoff = await getLastRunCutoff();
   const since = lastRunCutoff
     ? lastRunCutoff
     : new Date(Date.now() - settings.fetchWindowHours * 60 * 60 * 1000);
+
   console.log(
     lastRunCutoff
-      ? `Fetching emails since last run (${since.toISOString()}, with ${settings.overlapBufferMinutes}m overlap)...`
-      : `Fetching emails since ${since.toISOString()} (fallback: last ${settings.fetchWindowHours}h)...`
+      ? `Cutoff: ${since.toISOString()} (source: last run − ${settings.overlapBufferMinutes}m buffer)`
+      : `Cutoff: ${since.toISOString()} (source: ${settings.fetchWindowHours}h fallback window)`
   );
 
   let emailItems;
+  let labelIdToName;
   try {
-    emailItems = await fetchEmailIds(auth, since, settings.gmailLabels);
+    ({ items: emailItems, labelIdToName } = await fetchEmailIds(auth, since, settings.gmailLabels));
   } catch (err) {
     console.error('Failed to fetch email list:', err.message);
     process.exit(1);
   }
 
-  console.log(`Found ${emailItems.length} email(s) in window.`);
+  console.log(`Gmail returned: ${emailItems.length} email(s) across labels [${settings.gmailLabels.join(', ')}]`);
 
   const processedIds = await loadProcessedIds(since);
   const newItems = emailItems.filter(item => !processedIds.has(item.id));
-  console.log(`${newItems.length} new (unprocessed) email(s).`);
+  console.log(`Already processed (DB dedup): ${emailItems.length - newItems.length}`);
+  console.log(`Sent to Gemini: ${newItems.length}`);
 
   if (newItems.length === 0) {
     console.log('No new transactions found.');
@@ -132,14 +151,15 @@ async function main() {
   // 1. Fetch all bodies in parallel
   console.log('Fetching email bodies in parallel...');
   const fetchResults = await Promise.all(
-    newItems.map(async ({ id: emailId, label }) => {
+    newItems.map(async ({ id: emailId }) => {
       try {
         const data = await fetchEmailBody(auth, emailId);
+        const label = resolveLabelName(data.labelIds, labelIdToName, settings.gmailLabels);
         return { emailId, label, ...data };
       } catch (err) {
         console.error(`  [${emailId}] Failed to fetch body: ${err.message}`);
         await writeLog('ERROR', emailId, '', `fetch_failed: ${err.message}`);
-        return { emailId, label, fetchError: err.message };
+        return { emailId, label: settings.gmailLabels[0] || 'unknown', fetchError: err.message };
       }
     })
   );
@@ -225,9 +245,9 @@ async function main() {
 
   // ─── Summary ───────────────────────────────────────────────────────────────
   console.log('\n─── Summary ───────────────────────────────────');
-  console.log(`  Transactions logged : ${stats.parsed}`);
-  console.log(`  Non-transaction emails skipped : ${stats.skipped}`);
-  console.log(`  Parse / fetch errors : ${stats.errors}`);
+  console.log(`  Transactions logged  : ${stats.parsed}`);
+  console.log(`  Skipped (Gemini)     : ${stats.skipped}`);
+  console.log(`  Errors               : ${stats.errors}`);
   if (recategorized > 0) {
     console.log(`  Re-categorized   : ${recategorized} previously Uncategorized rows`);
   }
