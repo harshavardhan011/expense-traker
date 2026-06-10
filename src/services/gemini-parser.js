@@ -85,9 +85,15 @@ ${emailSections}`;
   try {
     parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) throw new Error('Response is not an array');
-  } catch {
+  } catch (parseErr) {
     console.error('Failed to parse Gemini batch response as JSON:', raw?.slice(0, 200));
-    return prepared.map(e => ({ emailId: e.emailId, label: e.label, subject: e.subject, expense: null }));
+    return prepared.map(e => ({
+      emailId: e.emailId,
+      label: e.label,
+      subject: e.subject,
+      expense: null,
+      geminiError: `json_parse_failed: ${parseErr.message}`,
+    }));
   }
 
   return prepared.map((e, i) => {

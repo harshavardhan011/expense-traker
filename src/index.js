@@ -198,7 +198,7 @@ async function main() {
           console.error(`  [${emailId}] Gemini error: ${geminiError}`);
           await writeLog('ERROR', emailId, subject || '', `gemini_failed: ${geminiError}`);
           stats.errors++;
-          await saveProcessedId(emailId);
+          // Do NOT saveProcessedId — let next run retry while email is still in fetch window
           continue;
         }
 
