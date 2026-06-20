@@ -1,5 +1,5 @@
+require('dotenv').config();
 const fs = require('fs');
-const path = require('path');
 const { authorize } = require('./auth');
 const { fetchEmailIds, fetchEmailBody, resolveLabelName } = require('./services/gmail-reader');
 const { parseExpensesBatch } = require('./services/gemini-parser');
@@ -9,17 +9,12 @@ const supabase = require('./services/db');
 const { bootstrapSchema } = require('./services/db-bootstrap');
 const settings = require('./config/settings');
 
-// ─── First-run setup ──────────────────────────────────────────────────────────
-
 function initDataDirectory() {
-  // Only ensure the data/ dir exists for OAuth credential files — all data now lives in Supabase
   if (!fs.existsSync(settings.dataDir)) {
     fs.mkdirSync(settings.dataDir, { recursive: true });
     console.log('Created data/ directory.');
   }
 }
-
-// ─── Activity log → Supabase ──────────────────────────────────────────────────
 
 async function writeLog(level, emailId, subject, detail) {
   const { error } = await supabase.from('activity_logs').insert({
@@ -29,12 +24,9 @@ async function writeLog(level, emailId, subject, detail) {
     detail,
   });
   if (error) {
-    // Non-fatal: log to stderr but don't crash the run
     console.error(`[writeLog] DB insert failed: ${error.message}`);
   }
 }
-
-// ─── State: processed email IDs → Supabase ────────────────────────────────────
 
 async function pruneProcessedIds() {
   const cutoff = new Date(Date.now() - settings.processedEmailsRetentionHours * 60 * 60 * 1000);
@@ -53,7 +45,7 @@ async function getLastRunCutoff() {
     .order('processed_at', { ascending: false })
     .limit(1)
     .maybeSingle();
-  if (!data) return null; // empty table → caller falls back to FETCH_WINDOW_HOURS
+  if (!data) return null;
   return new Date(
     new Date(data.processed_at).getTime() - settings.overlapBufferMinutes * 60 * 1000
   );
@@ -74,30 +66,25 @@ async function loadProcessedIds(since) {
 
 async function saveProcessedId(id) {
   const { error } = await supabase.from('processed_emails').insert({ email_id: id });
-  // Ignore duplicate key errors (email already marked processed)
   if (error && !error.message.includes('duplicate')) {
     console.error(`[saveProcessedId] failed for ${id}: ${error.message}`);
   }
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
-
-async function main() {
+async function runSync() {
   initDataDirectory();
 
   try {
     await bootstrapSchema();
   } catch (err) {
-    console.error('Schema bootstrap failed:', err.message);
-    process.exit(1);
+    throw new Error(`Schema bootstrap failed: ${err.message}`);
   }
 
   let auth;
   try {
     auth = await authorize();
   } catch (err) {
-    console.error('Authorization failed:', err.message);
-    process.exit(1);
+    throw new Error(`Authorization failed: ${err.message}`);
   }
 
   if (settings.processedEmailsRetentionHours < settings.fetchWindowHours) {
@@ -126,8 +113,7 @@ async function main() {
   try {
     ({ items: emailItems, labelIdToName } = await fetchEmailIds(auth, since, settings.gmailLabels));
   } catch (err) {
-    console.error('Failed to fetch email list:', err.message);
-    process.exit(1);
+    throw new Error(`Failed to fetch email list: ${err.message}`);
   }
 
   console.log(`Gmail returned: ${emailItems.length} email(s) across labels [${settings.gmailLabels.join(', ')}]`);
@@ -137,16 +123,16 @@ async function main() {
   console.log(`Already processed (DB dedup): ${emailItems.length - newItems.length}`);
   console.log(`Sent to Gemini: ${newItems.length}`);
 
+  const stats = { parsed: 0, skipped: 0, errors: 0, recategorized: 0 };
+
   if (newItems.length === 0) {
     console.log('No new transactions found.');
-    const recategorized = await recategorizeUncategorized();
-    if (recategorized > 0) {
-      console.log(`Re-categorized ${recategorized} previously Uncategorized rows.`);
+    stats.recategorized = await recategorizeUncategorized();
+    if (stats.recategorized > 0) {
+      console.log(`Re-categorized ${stats.recategorized} previously Uncategorized rows.`);
     }
-    return;
+    return stats;
   }
-
-  const stats = { parsed: 0, skipped: 0, errors: 0 };
 
   // 1. Fetch all bodies in parallel
   console.log('Fetching email bodies in parallel...');
@@ -185,11 +171,6 @@ async function main() {
       chunks.push(toparse.slice(i, i + batchSize));
     }
     for (const chunk of chunks) {
-      // DEBUG: log stripped bodies before sending to Gemini
-      for (const email of chunk) {
-        console.log(`\n=== [${email.emailId}] Subject: "${email.subject}" ===`);
-        console.log(email.body);
-      }
       const results = await parseExpensesBatch(chunk);
 
       // 3. Process results
@@ -198,7 +179,6 @@ async function main() {
           console.error(`  [${emailId}] Gemini error: ${geminiError}`);
           await writeLog('ERROR', emailId, subject || '', `gemini_failed: ${geminiError}`);
           stats.errors++;
-          // Do NOT saveProcessedId — let next run retry while email is still in fetch window
           continue;
         }
 
@@ -229,8 +209,6 @@ async function main() {
         };
 
         await insertExpense(row);
-
-        // Save state immediately after DB write — prevents duplicates on crash
         await saveProcessedId(emailId);
 
         console.log(
@@ -241,22 +219,18 @@ async function main() {
     }
   }
 
-  const recategorized = await recategorizeUncategorized();
+  stats.recategorized = await recategorizeUncategorized();
 
-  // ─── Summary ───────────────────────────────────────────────────────────────
   console.log('\n─── Summary ───────────────────────────────────');
   console.log(`  Transactions logged  : ${stats.parsed}`);
   console.log(`  Skipped (Gemini)     : ${stats.skipped}`);
   console.log(`  Errors               : ${stats.errors}`);
-  if (recategorized > 0) {
-    console.log(`  Re-categorized   : ${recategorized} previously Uncategorized rows`);
+  if (stats.recategorized > 0) {
+    console.log(`  Re-categorized       : ${stats.recategorized} previously Uncategorized rows`);
   }
-  console.log(`  DB : ${settings.supabaseUrl}`);
-  console.log(`  Log : activity_logs table in Supabase`);
   console.log('───────────────────────────────────────────────');
+
+  return stats;
 }
 
-main().catch(err => {
-  console.error('Unexpected error:', err);
-  process.exit(1);
-});
+module.exports = { runSync };
