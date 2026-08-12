@@ -1,4 +1,4 @@
-const supabase = require('./db');
+const { query, queryOne } = require('./db');
 
 // ─── Account CRUD ────────────────────────────────────────────────────────────
 
@@ -7,31 +7,29 @@ const supabase = require('./db');
  * If initialBalance > 0, also records an opening_balance transaction.
  */
 async function createAccount({ name, accountType, accountLast4, currency = 'INR', balance = 0, creditLimit = null }) {
-  const { data, error } = await supabase
-    .from('accounts')
-    .insert({
-      name,
-      account_type: accountType,
-      account_last4: accountLast4,
-      currency,
-      balance,
-      credit_limit: creditLimit,
-    })
-    .select('id, balance')
-    .single();
-
-  if (error) throw new Error(`createAccount failed: ${error.message}`);
+  let data;
+  try {
+    data = await queryOne(
+      `INSERT INTO accounts (name, account_type, account_last4, currency, balance, credit_limit)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       RETURNING id, balance`,
+      [name, accountType, accountLast4, currency, balance, creditLimit]
+    );
+  } catch (err) {
+    throw new Error(`createAccount failed: ${err.message}`);
+  }
 
   // Record opening balance transaction if non-zero
   if (balance !== 0) {
-    const { error: txnErr } = await supabase.from('account_transactions').insert({
-      account_id: data.id,
-      type: 'opening_balance',
-      amount: Math.abs(balance),
-      balance_after: balance,
-      description: 'Opening balance',
-    });
-    if (txnErr) console.warn(`[createAccount] opening_balance txn failed (non-fatal): ${txnErr.message}`);
+    try {
+      await query(
+        `INSERT INTO account_transactions (account_id, type, amount, balance_after, description)
+         VALUES ($1, 'opening_balance', $2, $3, 'Opening balance')`,
+        [data.id, Math.abs(balance), balance]
+      );
+    } catch (err) {
+      console.warn(`[createAccount] opening_balance txn failed (non-fatal): ${err.message}`);
+    }
   }
 
   return data;
@@ -41,12 +39,16 @@ async function createAccount({ name, accountType, accountLast4, currency = 'INR'
  * List all accounts. By default only active ones.
  */
 async function listAccounts({ activeOnly = true } = {}) {
-  let query = supabase.from('accounts').select('*').order('created_at', { ascending: true });
-  if (activeOnly) query = query.eq('is_active', true);
-
-  const { data, error } = await query;
-  if (error) throw new Error(`listAccounts failed: ${error.message}`);
-  return data || [];
+  try {
+    if (activeOnly) {
+      return await query(
+        `SELECT * FROM accounts WHERE is_active = true ORDER BY created_at ASC`
+      );
+    }
+    return await query(`SELECT * FROM accounts ORDER BY created_at ASC`);
+  } catch (err) {
+    throw new Error(`listAccounts failed: ${err.message}`);
+  }
 }
 
 /**
@@ -58,26 +60,29 @@ async function findAccount(accountType, accountLast4) {
   if (!accountLast4) return null;
 
   // 1. Exact match
-  const { data: exact, error: exactErr } = await supabase
-    .from('accounts')
-    .select('*')
-    .eq('account_type', accountType)
-    .eq('account_last4', accountLast4)
-    .eq('is_active', true)
-    .maybeSingle();
-
-  if (exactErr) throw new Error(`findAccount exact failed: ${exactErr.message}`);
+  let exact;
+  try {
+    exact = await queryOne(
+      `SELECT * FROM accounts
+       WHERE account_type = $1 AND account_last4 = $2 AND is_active = true`,
+      [accountType, accountLast4]
+    );
+  } catch (err) {
+    throw new Error(`findAccount exact failed: ${err.message}`);
+  }
   if (exact) return exact;
 
   // 2. Fallback: match by last4 alone (handles upi/netbanking → savings)
-  const { data: fallback, error: fbErr } = await supabase
-    .from('accounts')
-    .select('*')
-    .eq('account_last4', accountLast4)
-    .eq('is_active', true);
-
-  if (fbErr) throw new Error(`findAccount fallback failed: ${fbErr.message}`);
-  if (fallback && fallback.length === 1) return fallback[0];
+  let fallback;
+  try {
+    fallback = await query(
+      `SELECT * FROM accounts WHERE account_last4 = $1 AND is_active = true`,
+      [accountLast4]
+    );
+  } catch (err) {
+    throw new Error(`findAccount fallback failed: ${err.message}`);
+  }
+  if (fallback.length === 1) return fallback[0];
 
   // Ambiguous or no match
   return null;
@@ -87,14 +92,14 @@ async function findAccount(accountType, accountLast4) {
  * Find account by ID.
  */
 async function getAccountById(id) {
-  const { data, error } = await supabase
-    .from('accounts')
-    .select('*')
-    .eq('id', id)
-    .single();
-
-  if (error) throw new Error(`getAccountById failed: ${error.message}`);
-  return data;
+  let row;
+  try {
+    row = await queryOne(`SELECT * FROM accounts WHERE id = $1`, [id]);
+  } catch (err) {
+    throw new Error(`getAccountById failed: ${err.message}`);
+  }
+  if (!row) throw new Error(`getAccountById failed: no account with id ${id}`);
+  return row;
 }
 
 /**
@@ -105,19 +110,23 @@ async function resolveAccount(identifier) {
   // If it's a number > 9999, treat as account ID
   const num = Number(identifier);
   if (!isNaN(num) && num > 9999) {
-    const acct = await getAccountById(num);
-    return acct ? [acct] : [];
+    try {
+      const acct = await getAccountById(num);
+      return acct ? [acct] : [];
+    } catch (err) {
+      return [];
+    }
   }
 
   // Otherwise treat as last4
-  const { data, error } = await supabase
-    .from('accounts')
-    .select('*')
-    .eq('account_last4', identifier)
-    .eq('is_active', true);
-
-  if (error) throw new Error(`resolveAccount failed: ${error.message}`);
-  return data || [];
+  try {
+    return await query(
+      `SELECT * FROM accounts WHERE account_last4 = $1 AND is_active = true`,
+      [identifier]
+    );
+  } catch (err) {
+    throw new Error(`resolveAccount failed: ${err.message}`);
+  }
 }
 
 // ─── Balance Operations ──────────────────────────────────────────────────────
@@ -134,6 +143,14 @@ function computeDelta(accountType, expenseType, amount) {
   } else {
     return isCreditCard ? -amount : amount;
   }
+}
+
+async function callUpdateAccountBalance({ accountId, delta, txnType, description = null, expenseId = null }) {
+  const row = await queryOne(
+    `SELECT update_account_balance($1,$2,$3,$4,$5) AS balance`,
+    [accountId, delta, txnType, description, expenseId]
+  );
+  return row.balance;
 }
 
 /**
@@ -153,11 +170,10 @@ async function recordExpenseImpact(expenseRow, expenseId) {
   }
 
   // Idempotency: skip if already recorded
-  const { data: existing } = await supabase
-    .from('account_transactions')
-    .select('id')
-    .eq('expense_id', expenseId)
-    .maybeSingle();
+  const existing = await queryOne(
+    `SELECT id FROM account_transactions WHERE expense_id = $1`,
+    [expenseId]
+  );
 
   if (existing) return; // already processed
 
@@ -165,16 +181,16 @@ async function recordExpenseImpact(expenseRow, expenseId) {
   const txnType = expenseRow.type === 'DR' ? 'expense_dr' : 'expense_cr';
   const description = `${expenseRow.type} ${expenseRow.currency || 'INR'} ${expenseRow.amount} — ${expenseRow.merchant || 'Unknown'}`;
 
-  const { data, error } = await supabase.rpc('update_account_balance', {
-    p_account_id: account.id,
-    p_delta: delta,
-    p_txn_type: txnType,
-    p_description: description,
-    p_expense_id: expenseId,
-  });
-
-  if (error) {
-    console.error(`[accounts] Balance update failed for account ${account.id}: ${error.message}`);
+  try {
+    await callUpdateAccountBalance({
+      accountId: account.id,
+      delta,
+      txnType,
+      description,
+      expenseId,
+    });
+  } catch (err) {
+    console.error(`[accounts] Balance update failed for account ${account.id}: ${err.message}`);
   }
 }
 
@@ -182,45 +198,49 @@ async function recordExpenseImpact(expenseRow, expenseId) {
  * Add funds to a savings/salary account (salary deposit, manual transfer in).
  */
 async function addFunds(accountId, amount, description = 'Manual credit') {
-  const { data, error } = await supabase.rpc('update_account_balance', {
-    p_account_id: accountId,
-    p_delta: amount,
-    p_txn_type: 'manual_credit',
-    p_description: description,
-  });
-
-  if (error) throw new Error(`addFunds failed: ${error.message}`);
-  return data; // new balance
+  try {
+    return await callUpdateAccountBalance({
+      accountId,
+      delta: amount,
+      txnType: 'manual_credit',
+      description,
+    });
+  } catch (err) {
+    throw new Error(`addFunds failed: ${err.message}`);
+  }
 }
 
 /**
  * Record a credit card bill payment (reduces unbilled amount).
  */
 async function recordPayment(accountId, amount, description = 'Bill payment') {
-  const { data, error } = await supabase.rpc('update_account_balance', {
-    p_account_id: accountId,
-    p_delta: -amount,
-    p_txn_type: 'payment',
-    p_description: description,
-  });
-
-  if (error) throw new Error(`recordPayment failed: ${error.message}`);
-  return data; // new balance
+  try {
+    return await callUpdateAccountBalance({
+      accountId,
+      delta: -amount,
+      txnType: 'payment',
+      description,
+    });
+  } catch (err) {
+    throw new Error(`recordPayment failed: ${err.message}`);
+  }
 }
 
 /**
  * Fetch recent transactions for an account.
  */
 async function getAccountTransactions(accountId, limit = 20) {
-  const { data, error } = await supabase
-    .from('account_transactions')
-    .select('*')
-    .eq('account_id', accountId)
-    .order('created_at', { ascending: false })
-    .limit(limit);
-
-  if (error) throw new Error(`getAccountTransactions failed: ${error.message}`);
-  return data || [];
+  try {
+    return await query(
+      `SELECT * FROM account_transactions
+       WHERE account_id = $1
+       ORDER BY created_at DESC
+       LIMIT $2`,
+      [accountId, limit]
+    );
+  } catch (err) {
+    throw new Error(`getAccountTransactions failed: ${err.message}`);
+  }
 }
 
 /**
@@ -231,30 +251,35 @@ async function backfillAccountBalance(accountId) {
   const account = await getAccountById(accountId);
 
   // Fetch all expenses linked to this account
-  let query = supabase
-    .from('expenses')
-    .select('id, amount, type, currency, merchant, date')
-    .eq('account_last4', account.account_last4);
-
   // For credit_card accounts, match on account_type too
   // For savings/salary, also pick up upi/netbanking/bank_transfer expenses
-  if (account.account_type === 'credit_card') {
-    query = query.eq('account_type', 'credit_card');
+  let expenses;
+  try {
+    if (account.account_type === 'credit_card') {
+      expenses = await query(
+        `SELECT id, amount, type, currency, merchant, date FROM expenses
+         WHERE account_last4 = $1 AND account_type = 'credit_card'`,
+        [account.account_last4]
+      );
+    } else {
+      expenses = await query(
+        `SELECT id, amount, type, currency, merchant, date FROM expenses
+         WHERE account_last4 = $1`,
+        [account.account_last4]
+      );
+    }
+  } catch (err) {
+    throw new Error(`backfill: fetch expenses failed: ${err.message}`);
   }
 
-  const { data: expenses, error: expErr } = await query;
-  if (expErr) throw new Error(`backfill: fetch expenses failed: ${expErr.message}`);
-
-  let balance = 0;
   let count = 0;
 
-  for (const exp of (expenses || [])) {
+  for (const exp of expenses) {
     // Check if this expense already has a transaction record
-    const { data: existing } = await supabase
-      .from('account_transactions')
-      .select('id')
-      .eq('expense_id', exp.id)
-      .maybeSingle();
+    const existing = await queryOne(
+      `SELECT id FROM account_transactions WHERE expense_id = $1`,
+      [exp.id]
+    );
 
     if (existing) continue; // already recorded
 
@@ -262,16 +287,16 @@ async function backfillAccountBalance(accountId) {
     const txnType = exp.type === 'DR' ? 'expense_dr' : 'expense_cr';
     const description = `[backfill] ${exp.type} ${exp.currency || 'INR'} ${exp.amount} — ${exp.merchant || 'Unknown'} (${exp.date})`;
 
-    const { error: rpcErr } = await supabase.rpc('update_account_balance', {
-      p_account_id: accountId,
-      p_delta: delta,
-      p_txn_type: txnType,
-      p_description: description,
-      p_expense_id: exp.id,
-    });
-
-    if (rpcErr) {
-      console.error(`[backfill] Failed for expense ${exp.id}: ${rpcErr.message}`);
+    try {
+      await callUpdateAccountBalance({
+        accountId,
+        delta,
+        txnType,
+        description,
+        expenseId: exp.id,
+      });
+    } catch (err) {
+      console.error(`[backfill] Failed for expense ${exp.id}: ${err.message}`);
       continue;
     }
     count++;

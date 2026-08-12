@@ -11,6 +11,15 @@ const {
   backfillAccountBalance,
 } = require('./services/account-manager');
 const { listExpenses, getExpenseById } = require('./services/expense-reader');
+const { updateExpenseNotes } = require('./services/expense-writer');
+const {
+  listUncategorizedMerchants,
+  listCategories,
+  setMerchantCategory,
+  listCategoriesWithCounts,
+  renameCategory,
+  deleteCategory,
+} = require('./services/category-service');
 const { runSync } = require('./pipeline');
 
 const app = express();
@@ -87,6 +96,58 @@ app.get('/expenses', ah(async (req, res) => {
 app.get('/expenses/:id', ah(async (req, res) => {
   const expense = await getExpenseById(Number(req.params.id));
   res.json(expense);
+}));
+
+app.patch('/expenses/:id', ah(async (req, res) => {
+  const { notes } = req.body;
+  const updated = await updateExpenseNotes(Number(req.params.id), notes ?? null);
+  res.json(updated);
+}));
+
+// Categories
+app.get('/categories', ah(async (_req, res) => {
+  const data = await listCategories();
+  res.json(data);
+}));
+
+app.get('/categories/stats', ah(async (_req, res) => {
+  const data = await listCategoriesWithCounts();
+  res.json(data);
+}));
+
+app.get('/merchants/uncategorized', ah(async (_req, res) => {
+  const data = await listUncategorizedMerchants();
+  res.json(data);
+}));
+
+app.post('/merchant-mappings', ah(async (req, res) => {
+  const { merchant, category } = req.body;
+  if (!merchant || !category) {
+    return res.status(400).json({ error: 'merchant and category are required' });
+  }
+  const result = await setMerchantCategory(merchant, category);
+  res.json(result);
+}));
+
+app.post('/categories/rename', ah(async (req, res) => {
+  const { from, to } = req.body;
+  if (!from || !to) {
+    return res.status(400).json({ error: 'from and to are required' });
+  }
+  if (from === to) {
+    return res.status(400).json({ error: 'from and to must differ' });
+  }
+  const result = await renameCategory(from, to);
+  res.json(result);
+}));
+
+app.post('/categories/delete', ah(async (req, res) => {
+  const { name } = req.body;
+  if (!name) {
+    return res.status(400).json({ error: 'name is required' });
+  }
+  const result = await deleteCategory(name);
+  res.json(result);
 }));
 
 // Sync

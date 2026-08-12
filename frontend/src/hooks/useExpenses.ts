@@ -1,5 +1,5 @@
-import { useQuery } from '@tanstack/react-query'
-import { getExpenses } from '../lib/api'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { getExpenses, updateExpenseNotes } from '../lib/api'
 
 export function useExpenses(params?: {
   limit?: number
@@ -10,5 +10,15 @@ export function useExpenses(params?: {
   return useQuery({
     queryKey: ['expenses', params],
     queryFn: () => getExpenses(params),
+  })
+}
+
+export function useUpdateNotes() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, notes }: { id: number; notes: string }) => updateExpenseNotes(id, notes),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['expenses'] })
+    },
   })
 }

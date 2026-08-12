@@ -1,4 +1,4 @@
-import type { Account, AccountTxn, CreateAccountPayload, Expense, SyncStats } from '../types'
+import type { Account, AccountTxn, CreateAccountPayload, Expense, SyncStats, UncategorizedMerchant } from '../types'
 
 const BASE = '/api'
 
@@ -23,6 +23,19 @@ async function apiGet<T>(path: string): Promise<T> {
 async function apiPost<T>(path: string, body?: unknown): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     method: 'POST',
+    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  })
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({ error: res.statusText }))
+    throw new ApiError(res.status, data.error ?? res.statusText)
+  }
+  return res.json() as Promise<T>
+}
+
+async function apiPatch<T>(path: string, body?: unknown): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: 'PATCH',
     headers: body ? { 'Content-Type': 'application/json' } : undefined,
     body: body ? JSON.stringify(body) : undefined,
   })
@@ -78,6 +91,39 @@ export function getExpenses(params?: {
   if (params?.accountLast4) qs.set('accountLast4', params.accountLast4)
   const q = qs.toString()
   return apiGet(`/expenses${q ? `?${q}` : ''}`)
+}
+
+export function updateExpenseNotes(id: number, notes: string): Promise<Expense> {
+  return apiPatch(`/expenses/${id}`, { notes })
+}
+
+// ─── Categories / Merchant mappings ──────────────────────────────────────────
+
+export function getCategories(): Promise<string[]> {
+  return apiGet('/categories')
+}
+
+export function getCategoryStats(): Promise<{ category: string; count: number }[]> {
+  return apiGet('/categories/stats')
+}
+
+export function getUncategorizedMerchants(): Promise<UncategorizedMerchant[]> {
+  return apiGet('/merchants/uncategorized')
+}
+
+export function setMerchantCategory(
+  merchant: string,
+  category: string,
+): Promise<{ recategorized: number }> {
+  return apiPost('/merchant-mappings', { merchant, category })
+}
+
+export function renameCategory(from: string, to: string): Promise<{ updated: number }> {
+  return apiPost('/categories/rename', { from, to })
+}
+
+export function deleteCategory(name: string): Promise<{ reassigned: number }> {
+  return apiPost('/categories/delete', { name })
 }
 
 // ─── Sync ─────────────────────────────────────────────────────────────────────

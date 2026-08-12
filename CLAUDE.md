@@ -6,10 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```
 expense-tracker/
-├── backend/    ← Node.js ≥22 Express API + Gmail→Gemini→Supabase pipeline
+├── backend/    ← Node.js ≥22 Express API + Gmail→Gemini→PostgreSQL pipeline
 │                 All npm commands run from here (cd backend first)
-└── frontend/   ← Planned UI workspace (currently empty)
-                  Will consume the backend REST API at http://localhost:3000
+└── frontend/   ← React + TypeScript UI (Vite, TanStack Query, Tailwind)
+                  Consumes the backend REST API via /api proxy → http://localhost:3000
+                  Pages: Expenses (with notes), Categorize (category management), Accounts
 ```
 
 > **Note:** The repo is mid-restructure. If `git status` shows old root-level paths (e.g. `src/`, `CLAUDE.md`, `README.md`) as deleted `D`, that's expected — they moved to `backend/` and the commit hasn't landed yet.
@@ -21,8 +22,9 @@ All commands must be run from the `backend/` directory.
 ```bash
 npm install          # install dependencies
 npm run auth         # one-time Gmail OAuth flow — creates data/token.json
-npm run server       # start the HTTP API server (default port 3000)
-npm start            # one-shot sync: fetch + parse emails → Supabase (script mode, kept for cron use)
+npm run dev          # start the HTTP API server with auto-reload on file change (use this during development)
+npm run server       # start the HTTP API server without auto-reload (use for production/cron)
+npm start            # one-shot sync: fetch + parse emails → PostgreSQL (script mode, kept for cron use)
 npm run cli -- account list            # list all accounts with balances
 npm run cli -- account add             # add a new account (interactive)
 npm run cli -- account add-funds 1482  # add funds to savings/salary account
@@ -50,6 +52,13 @@ No test runner or linter is configured.
 | POST | `/accounts/:id/backfill` | Recalculate balance from existing expenses |
 | GET | `/expenses?limit=&offset=&category=&accountLast4=` | List expenses (newest first) |
 | GET | `/expenses/:id` | Get expense by ID |
+| PATCH | `/expenses/:id` | Update an expense's `notes` field `{ notes }` — the only per-row expense write |
+| GET | `/categories` | Distinct non-Uncategorized category names |
+| GET | `/categories/stats` | Categories with usage counts `[{ category, count }]` |
+| GET | `/merchants/uncategorized` | Merchants still tagged `Uncategorized`, with txn count + total |
+| POST | `/merchant-mappings` | Map a merchant to a category `{ merchant, category }`; retroactively recategorizes |
+| POST | `/categories/rename` | Rename a category everywhere `{ from, to }` |
+| POST | `/categories/delete` | Delete a category `{ name }` — expenses fall back to Uncategorized, mappings removed |
 | POST | `/sync` | Trigger Gmail sync pipeline; returns `{ parsed, skipped, errors, recategorized }`. Returns 409 if already running. Requires `data/token.json` (run `npm run auth` first). |
 
 ## Architecture
@@ -65,16 +74,18 @@ Both call `runSync()` from `backend/src/pipeline.js`.
         ↓
   src/pipeline.js  (runSync)
         ↓
-Gmail API → email IDs → filter duplicates → fetch bodies (parallel) → Gemini batch → merchant map → Supabase
+Gmail API → email IDs → filter duplicates → fetch bodies (parallel) → Gemini batch → merchant map → PostgreSQL
 ```
 
 **Data flow:**
 1. `auth.js` — OAuth2 Desktop App flow. Uses `getFreePort()` so the redirect URI port is truly ephemeral (the `oauthRedirectPort` setting is not used). Redirect URI must use `127.0.0.1` (not `localhost`) to avoid IPv6 mismatch on Windows. Token cached in `data/token.json`; auto-refreshed if expired.
 2. `services/gmail-reader.js` — Resolves each label name → ID at runtime (returns `null`, not `undefined`, if not found — avoids returning ALL messages). Supports multiple labels (`GMAIL_LABELS` comma-separated); deduplication is first-label-wins. Gmail `after:` query needs Unix **seconds** (divide `Date.now()` by 1000). Body extracted by walking the MIME tree: prefers `text/plain`, falls back to `text/html`. Gmail returns URL-safe base64; decode with `-`→`+`, `_`→`/` before `Buffer.from`.
 3. `services/gemini-parser.js` — Uses `@google/genai` SDK (`GoogleGenAI`), model `gemini-2.5-flash`, `responseMimeType: 'application/json'`, `temperature: 0`. Emails are batched (controlled by `GEMINI_BATCH_SIZE`, default 20). Each email is truncated to 1500 chars before being sent. Returns `null` expense for non-transaction emails. Uses Gmail `receivedAt` as date fallback.
-4. `services/db-merchant-mapper.js` — Active merchant→category lookup via Supabase `merchant_mappings` table. Auto-inserts 'Uncategorized' for unknown merchants.
-5. `services/account-manager.js` — Account CRUD, balance updates, and expense-to-account linking. Uses `update_account_balance` Postgres RPC for atomic balance mutations. Finds accounts by `(account_type, account_last4)` with last4-only fallback for UPI/netbanking expenses linking to savings accounts.
+4. `services/db-merchant-mapper.js` — Active merchant→category lookup via the `merchant_mappings` table. Auto-inserts 'Uncategorized' for unknown merchants.
+5. `services/account-manager.js` — Account CRUD, balance updates, and expense-to-account linking. Uses the `update_account_balance` Postgres function for atomic balance mutations. Finds accounts by `(account_type, account_last4)` with last4-only fallback for UPI/netbanking expenses linking to savings accounts.
 6. `services/expense-reader.js` — Read-only queries for the `expenses` table (`listExpenses`, `getExpenseById`). Used by the HTTP server.
+6a. `services/expense-writer.js` — Per-expense field updates. Currently just `updateExpenseNotes(id, notes)`, backing `PATCH /expenses/:id`. This is the only endpoint that writes a single expense row directly; category changes are bulk operations (see below).
+6b. `services/category-service.js` — Category-level read/write. Categories are not a table — they exist only as text on `expenses.category` and `merchant_mappings.category`. `listCategoriesWithCounts` aggregates usage; `renameCategory`/`deleteCategory` bulk-update both tables (delete reassigns affected expenses to `Uncategorized` and removes the merchant mappings so those merchants resurface on `/categorize`). Preset-vs-custom category distinction is frontend-only (`frontend/src/lib/categories.ts`).
 7. `src/pipeline.js` — Core sync logic. State saved **per-email** immediately after DB write (not at end of run), so a crash mid-run doesn't cause duplicates on restart. Returns `{ parsed, skipped, errors, recategorized }`; throws on fatal errors instead of `process.exit`.
 8. `src/index.js` — Thin wrapper: calls `runSync()` and exits. Preserves `npm start` behaviour.
 9. `src/cli.js` — Interactive CLI for account management (list, add, add-funds, pay, history, backfill). Uses Node.js `readline`. (Will eventually be replaced by HTTP endpoints.)
@@ -88,14 +99,18 @@ Key `.env` variables (see `backend/.env.example` for structure):
 | Variable | Default | Description |
 |---|---|---|
 | `GEMINI_API_KEY` | *(required)* | Gemini API key |
-| `SUPABASE_URL` | *(required)* | Supabase project URL |
-| `SUPABASE_ANON_KEY` | *(required)* | Supabase anon/public API key |
-| `DATABASE_URL` | *(optional)* | Postgres connection string — used only for schema bootstrap |
+| `DATABASE_URL` | *(required)* | Local Postgres connection string — used for all queries and schema bootstrap |
 | `GMAIL_LABELS` | `bank-alerts` | Comma-separated Gmail label names to scan |
 | `GMAIL_LABEL` | — | Legacy alias for `GMAIL_LABELS` (single label) |
 | `FETCH_WINDOW_HOURS` | `24` | How far back to scan; increase if running infrequently |
 | `GEMINI_BATCH_SIZE` | `20` | Emails per Gemini API call |
 | `PORT` | `3000` | HTTP server port |
+
+### Local PostgreSQL setup
+
+1. Install Postgres and create a database, e.g. `createdb expense_tracker`.
+2. Set `DATABASE_URL` in `backend/.env`, e.g. `postgresql://postgres:password@localhost:5432/expense_tracker`.
+3. Tables are created automatically on server startup (`bootstrapSchema()` in `services/db-bootstrap.js` applies `db/schema.sql`) — no manual migration needed.
 
 ## Data Files (`backend/data/`)
 
@@ -107,15 +122,15 @@ Key `.env` variables (see `backend/.env.example` for structure):
 | `expenses.csv` | Legacy CSV output (superseded by `expenses` table) |
 | `activity.log` | Legacy file log (superseded by `activity_logs` table) |
 
-**To re-process emails:** truncate the `processed_emails` Supabase table and increase `FETCH_WINDOW_HOURS`.
+**To re-process emails:** truncate the `processed_emails` table and increase `FETCH_WINDOW_HOURS`.
 
-## Supabase Tables
+## Database Tables
 
-Schema defined in `backend/db/schema.sql` (single source of truth). All tables and the `update_account_balance` RPC are created automatically on startup via `CREATE TABLE IF NOT EXISTS` / `CREATE OR REPLACE FUNCTION` — idempotent, safe to run every time.
+Schema defined in `backend/db/schema.sql` (single source of truth). All tables and the `update_account_balance` function are created automatically on startup via `CREATE TABLE IF NOT EXISTS` / `CREATE OR REPLACE FUNCTION` — idempotent, safe to run every time.
 
 | Table | Purpose |
 |-------|---------|
-| `expenses` | Transaction records (one row per parsed email) |
+| `expenses` | Transaction records (one row per parsed email). Includes a user-editable `notes TEXT` column, set via `PATCH /expenses/:id` — never written by the sync pipeline, so it survives re-sync upserts. |
 | `processed_emails` | Deduplication state for email processing |
 | `merchant_mappings` | Merchant → category lookup |
 | `activity_logs` | Audit trail for skipped/errored emails |
@@ -127,7 +142,7 @@ Schema defined in `backend/db/schema.sql` (single source of truth). All tables a
 - **Savings/salary**: `balance` = available funds (positive = you have). DR decreases, CR/manual credit increases.
 - Linking: expenses match accounts by `(account_type, account_last4)` with last4-only fallback.
 - Idempotent: `account_transactions.expense_id` prevents double-counting on re-runs.
-- Atomic: `update_account_balance` RPC function handles UPDATE + INSERT in one transaction.
+- Atomic: `update_account_balance` Postgres function handles UPDATE + INSERT in one transaction.
 
 ## Key Design Constraints
 

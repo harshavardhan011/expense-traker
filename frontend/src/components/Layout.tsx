@@ -2,12 +2,14 @@ import { useState, type ReactNode } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
 import { ApiError } from '../lib/api'
 import { useSync } from '../hooks/useSync'
+import { useUncategorizedMerchants } from '../hooks/useCategories'
 import { useToast } from '../context/ToastContext'
 import { Spinner } from './Spinner'
 
 const NAV_ITEMS = [
   { to: '/', label: 'Dashboard', icon: '📊' },
   { to: '/expenses', label: 'Expenses', icon: '🧾' },
+  { to: '/categorize', label: 'Categorize', icon: '🏷️' },
   { to: '/accounts', label: 'Accounts', icon: '🏦' },
 ]
 
@@ -16,6 +18,8 @@ export function Layout({ children }: { children: ReactNode }) {
   const { toast } = useToast()
   const sync = useSync()
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const { data: uncategorized } = useUncategorizedMerchants()
+  const uncategorizedCount = uncategorized?.length ?? 0
 
   const pageTitle = NAV_ITEMS.find((n) => {
     if (n.to === '/') return location.pathname === '/'
@@ -78,7 +82,12 @@ export function Layout({ children }: { children: ReactNode }) {
               }
             >
               <span className="text-lg leading-none">{item.icon}</span>
-              {item.label}
+              <span className="flex-1">{item.label}</span>
+              {item.to === '/categorize' && uncategorizedCount > 0 && (
+                <span className="ml-auto text-xs font-semibold bg-red-500 text-white rounded-full px-1.5 py-0.5 min-w-[20px] text-center leading-tight">
+                  {uncategorizedCount}
+                </span>
+              )}
             </NavLink>
           ))}
         </nav>

@@ -5,7 +5,7 @@ const { fetchEmailIds, fetchEmailBody, resolveLabelName } = require('./services/
 const { parseExpensesBatch } = require('./services/gemini-parser');
 const { getCategory } = require('./services/db-merchant-mapper');
 const { insertExpense, recategorizeUncategorized } = require('./services/db-writer');
-const supabase = require('./services/db');
+const { query, queryOne } = require('./services/db');
 const { bootstrapSchema } = require('./services/db-bootstrap');
 const settings = require('./config/settings');
 
@@ -17,34 +17,33 @@ function initDataDirectory() {
 }
 
 async function writeLog(level, emailId, subject, detail) {
-  const { error } = await supabase.from('activity_logs').insert({
-    level,
-    email_id: emailId,
-    subject: subject || '',
-    detail,
-  });
-  if (error) {
-    console.error(`[writeLog] DB insert failed: ${error.message}`);
+  try {
+    await query(
+      `INSERT INTO activity_logs (level, email_id, subject, detail) VALUES ($1,$2,$3,$4)`,
+      [level, emailId, subject || '', detail]
+    );
+  } catch (err) {
+    console.error(`[writeLog] DB insert failed: ${err.message}`);
   }
 }
 
 async function pruneProcessedIds() {
   const cutoff = new Date(Date.now() - settings.processedEmailsRetentionHours * 60 * 60 * 1000);
-  const { count, error } = await supabase
-    .from('processed_emails')
-    .delete({ count: 'exact' })
-    .lt('processed_at', cutoff.toISOString());
-  if (error) console.warn('[pruneProcessedIds] failed (non-fatal):', error.message);
-  else if (count > 0) console.log(`Pruned ${count} old processed_emails entries.`);
+  try {
+    const rows = await query(
+      `DELETE FROM processed_emails WHERE processed_at < $1 RETURNING email_id`,
+      [cutoff.toISOString()]
+    );
+    if (rows.length > 0) console.log(`Pruned ${rows.length} old processed_emails entries.`);
+  } catch (err) {
+    console.warn('[pruneProcessedIds] failed (non-fatal):', err.message);
+  }
 }
 
 async function getLastRunCutoff() {
-  const { data } = await supabase
-    .from('processed_emails')
-    .select('processed_at')
-    .order('processed_at', { ascending: false })
-    .limit(1)
-    .maybeSingle();
+  const data = await queryOne(
+    `SELECT processed_at FROM processed_emails ORDER BY processed_at DESC LIMIT 1`
+  );
   if (!data) return null;
   return new Date(
     new Date(data.processed_at).getTime() - settings.overlapBufferMinutes * 60 * 1000
@@ -53,21 +52,26 @@ async function getLastRunCutoff() {
 
 async function loadProcessedIds(since) {
   const windowStart = new Date(since.getTime() - settings.overlapBufferMinutes * 60 * 1000);
-  const { data, error } = await supabase
-    .from('processed_emails')
-    .select('email_id')
-    .gte('processed_at', windowStart.toISOString());
-  if (error) {
-    console.warn('Could not load processed emails from DB:', error.message);
+  try {
+    const rows = await query(
+      `SELECT email_id FROM processed_emails WHERE processed_at >= $1`,
+      [windowStart.toISOString()]
+    );
+    return new Set(rows.map(r => r.email_id));
+  } catch (err) {
+    console.warn('Could not load processed emails from DB:', err.message);
     return new Set();
   }
-  return new Set((data || []).map(r => r.email_id));
 }
 
 async function saveProcessedId(id) {
-  const { error } = await supabase.from('processed_emails').insert({ email_id: id });
-  if (error && !error.message.includes('duplicate')) {
-    console.error(`[saveProcessedId] failed for ${id}: ${error.message}`);
+  try {
+    await query(
+      `INSERT INTO processed_emails (email_id) VALUES ($1) ON CONFLICT (email_id) DO NOTHING`,
+      [id]
+    );
+  } catch (err) {
+    console.error(`[saveProcessedId] failed for ${id}: ${err.message}`);
   }
 }
 

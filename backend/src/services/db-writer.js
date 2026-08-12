@@ -1,4 +1,4 @@
-const supabase = require('./db');
+const { query, queryOne } = require('./db');
 const { recordExpenseImpact } = require('./account-manager');
 
 /**
@@ -7,24 +7,44 @@ const { recordExpenseImpact } = require('./account-manager');
  * After upsert, updates the linked account balance (if any).
  */
 async function insertExpense(row) {
-  const { data, error } = await supabase.from('expenses').upsert(
-    {
-      email_id: row.emailId,
-      label: row.label,
-      date: row.date,
-      amount: row.amount,
-      currency: row.currency,
-      type: row.type,
-      merchant: row.merchant,
-      category: row.category,
-      raw_description: row.rawDescription,
-      available_credit_limit: row.availableCreditLimit ?? null,
-      account_type: row.accountType ?? null,
-      account_last4: row.accountLast4 ?? null,
-    },
-    { onConflict: 'email_id' }
-  ).select('id').single();
-  if (error) throw new Error(`insertExpense failed: ${error.message}`);
+  let data;
+  try {
+    data = await queryOne(
+      `INSERT INTO expenses (
+         email_id, label, date, amount, currency, type, merchant, category,
+         raw_description, available_credit_limit, account_type, account_last4
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       ON CONFLICT (email_id) DO UPDATE SET
+         label = EXCLUDED.label,
+         date = EXCLUDED.date,
+         amount = EXCLUDED.amount,
+         currency = EXCLUDED.currency,
+         type = EXCLUDED.type,
+         merchant = EXCLUDED.merchant,
+         category = EXCLUDED.category,
+         raw_description = EXCLUDED.raw_description,
+         available_credit_limit = EXCLUDED.available_credit_limit,
+         account_type = EXCLUDED.account_type,
+         account_last4 = EXCLUDED.account_last4
+       RETURNING id`,
+      [
+        row.emailId,
+        row.label,
+        row.date,
+        row.amount,
+        row.currency,
+        row.type,
+        row.merchant,
+        row.category,
+        row.rawDescription,
+        row.availableCreditLimit ?? null,
+        row.accountType ?? null,
+        row.accountLast4 ?? null,
+      ]
+    );
+  } catch (err) {
+    throw new Error(`insertExpense failed: ${err.message}`);
+  }
 
   // Update linked account balance (non-blocking — warns if no account found)
   try {
@@ -40,40 +60,22 @@ async function insertExpense(row) {
  * Returns the number of rows updated.
  */
 async function recategorizeUncategorized() {
-  // Fetch all uncategorized expenses
-  const { data: rows, error: fetchErr } = await supabase
-    .from('expenses')
-    .select('id, merchant')
-    .eq('category', 'Uncategorized');
-
-  if (fetchErr) throw new Error(`recategorize fetch failed: ${fetchErr.message}`);
-  if (!rows || rows.length === 0) return 0;
-
-  // Fetch all current mappings in one go
-  const { data: mappings, error: mapErr } = await supabase
-    .from('merchant_mappings')
-    .select('merchant, category')
-    .neq('category', 'Uncategorized');
-
-  if (mapErr) throw new Error(`recategorize mappings fetch failed: ${mapErr.message}`);
-
-  const map = new Map((mappings || []).map(m => [m.merchant, m.category]));
-
-  let count = 0;
-  for (const row of rows) {
-    const key = (row.merchant || '').toLowerCase().trim();
-    const newCategory = map.get(key);
-    if (newCategory) {
-      const { error: updateErr } = await supabase
-        .from('expenses')
-        .update({ category: newCategory })
-        .eq('id', row.id);
-      if (updateErr) throw new Error(`recategorize update failed: ${updateErr.message}`);
-      count++;
-    }
+  let rows;
+  try {
+    rows = await query(
+      `UPDATE expenses e
+       SET category = m.category
+       FROM merchant_mappings m
+       WHERE e.category = 'Uncategorized'
+         AND m.category <> 'Uncategorized'
+         AND lower(trim(e.merchant)) = m.merchant
+       RETURNING e.id`
+    );
+  } catch (err) {
+    throw new Error(`recategorize update failed: ${err.message}`);
   }
 
-  return count;
+  return rows.length;
 }
 
 module.exports = { insertExpense, recategorizeUncategorized };

@@ -2,14 +2,14 @@
 
 ## 1. Overview
 
-A Node.js application that reads bank payment alert emails from Gmail, parses them using Google Gemini Flash API, auto-categorizes using a merchant mapping table in Supabase, and stores all expense and account data to PostgreSQL (Supabase).
+A Node.js application that reads bank payment alert emails from Gmail, parses them using Google Gemini Flash API, auto-categorizes using a merchant mapping table, and stores all expense and account data to a local PostgreSQL database.
 
 The app has two entry points that share the same core pipeline:
 
 - **`src/server.js`** — Express HTTP API server (primary). Exposes REST endpoints so any UI can connect. Runs persistently with `npm run server`.
 - **`src/index.js`** — One-shot script wrapper (kept for cron/manual use). Calls `runSync()` and exits. Runs with `npm start`.
 
-All persistent state lives in Supabase. Only OAuth credential files remain local.
+All persistent state lives in local PostgreSQL. Only OAuth credential files remain outside the database.
 
 ---
 
@@ -95,20 +95,20 @@ expense-manager/
 │   ├── config/
 │   │   └── settings.js             # All configuration in one place
 │   └── services/
-│       ├── db.js                   # Supabase client singleton
+│       ├── db.js                   # pg Pool + query/queryOne/withTransaction helpers
 │       ├── db-bootstrap.js         # Applies db/schema.sql via raw pg connection
-│       ├── db-writer.js            # Insert/upsert expenses into Supabase
+│       ├── db-writer.js            # Insert/upsert expenses into PostgreSQL
 │       ├── db-merchant-mapper.js   # DB-backed merchant lookup + in-process cache
-│       ├── account-manager.js      # Account CRUD + balance operations (RPC)
+│       ├── account-manager.js      # Account CRUD + balance operations (Postgres function)
 │       ├── expense-reader.js       # Read-only queries for expenses table
+│       ├── expense-writer.js       # Per-expense field updates (e.g. notes)
+│       ├── category-service.js     # Category listing/stats, merchant categorization, rename/delete
 │       ├── gmail-reader.js         # Gmail API integration
 │       ├── gemini-parser.js        # Gemini Flash API for parsing emails
 │       ├── csv-writer.js           # [DEPRECATED — replaced by db-writer.js]
 │       └── merchant-mapper.js      # [DEPRECATED — replaced by db-merchant-mapper.js]
 ├── db/
-│   └── schema.sql                  # Single source of truth for all tables + RPC
-├── scripts/
-│   └── migrate-to-supabase.js      # One-time migration: CSV/JSON files → Supabase
+│   └── schema.sql                  # Single source of truth for all tables + functions
 ├── data/
 │   ├── credentials.json            # Google OAuth creds (user provides, never in DB)
 │   └── token.json                  # Auto-generated after first auth (never in DB)
@@ -136,8 +136,7 @@ module.exports = {
   geminiApiKey: process.env.GEMINI_API_KEY,
   geminiModel: 'gemini-2.5-flash',
   geminiBatchSize: 20,
-  supabaseUrl: process.env.SUPABASE_URL,
-  supabaseAnonKey: process.env.SUPABASE_ANON_KEY,
+  databaseUrl: process.env.DATABASE_URL,
   dataDir: './data',
   credentialsPath: './data/credentials.json',
   tokenPath: './data/token.json',
@@ -191,15 +190,20 @@ Sends emails in batches to Gemini Flash (`gemini-2.5-flash`), `responseMimeType:
 
 ### 4.5 `src/services/db.js`
 
-Supabase client singleton shared by all services:
+`pg` Pool + query helpers shared by all services:
 
 ```javascript
-const { createClient } = require('@supabase/supabase-js');
-const supabase = createClient(settings.supabaseUrl, settings.supabaseAnonKey);
-module.exports = supabase;
+const { Pool } = require('pg');
+const pool = new Pool({ connectionString: settings.databaseUrl });
+
+async function query(text, params) { /* returns res.rows */ }
+async function queryOne(text, params) { /* returns res.rows[0] ?? null */ }
+async function withTransaction(fn) { /* BEGIN/COMMIT/ROLLBACK wrapper */ }
+
+module.exports = { pool, query, queryOne, withTransaction };
 ```
 
-Throws at import time if `SUPABASE_URL` / `SUPABASE_ANON_KEY` are missing.
+Throws at import time if `DATABASE_URL` is missing.
 
 ### 4.6 `src/services/db-bootstrap.js`
 
@@ -237,17 +241,17 @@ Account CRUD and balance management. All functions return data or throw — no `
 | `findAccount` | `(accountType, accountLast4)` | Exact match; falls back to last4-only for savings/UPI linking |
 | `getAccountById` | `(id)` | SELECT by PK |
 | `resolveAccount` | `(identifier)` | By ID (>9999) or last4; returns array (ambiguity-safe) |
-| `recordExpenseImpact` | `(expenseRow, expenseId)` | Links expense to account; calls `update_account_balance` RPC |
-| `addFunds` | `(accountId, amount, description)` | RPC `manual_credit` delta |
-| `recordPayment` | `(accountId, amount, description)` | RPC `payment` negative delta |
+| `recordExpenseImpact` | `(expenseRow, expenseId)` | Links expense to account; calls `update_account_balance` function |
+| `addFunds` | `(accountId, amount, description)` | `manual_credit` delta |
+| `recordPayment` | `(accountId, amount, description)` | `payment` negative delta |
 | `getAccountTransactions` | `(accountId, limit=20)` | SELECT from account_transactions, newest first |
-| `backfillAccountBalance` | `(accountId)` | Re-run all linked expenses through the RPC; returns `{ balance, expensesLinked }` |
+| `backfillAccountBalance` | `(accountId)` | Re-run all linked expenses through `update_account_balance`; returns `{ balance, expensesLinked }` |
 
 **Balance semantics:**
 - Credit card: DR → +delta (owe more), CR/payment → −delta (owe less)
 - Savings/salary: DR → −delta (funds leave), CR/manual_credit → +delta (funds arrive)
 
-**`update_account_balance` RPC** — atomically updates `accounts.balance += p_delta` and inserts an `account_transactions` row; returns new balance.
+**`update_account_balance` Postgres function** — atomically updates `accounts.balance += p_delta` and inserts an `account_transactions` row; returns new balance.
 
 ### 4.10 `src/services/expense-reader.js`
 
@@ -258,6 +262,27 @@ Read-only queries for the `expenses` table, used by the HTTP server.
 - Pagination via `.range(offset, offset+limit-1)`
 
 **`getExpenseById(id)`** → `expense`
+
+### 4.10a `src/services/expense-writer.js`
+
+Per-expense field updates (the only true single-row write path; everything else is bulk via category/merchant operations).
+
+**`updateExpenseNotes(id, notes)`** → `expense` — `UPDATE expenses SET notes = ? WHERE id = ?`, returns the updated row.
+
+### 4.10b `src/services/category-service.js`
+
+Category-level read/write operations. Note: categories are not a dedicated table — they exist only as text on `expenses.category` and `merchant_mappings.category`.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `listUncategorizedMerchants` | `()` | Aggregates expenses with `category='Uncategorized'` by merchant → `{merchant, count, total}[]` |
+| `listCategories` | `()` | Distinct non-Uncategorized categories from both `expenses` and `merchant_mappings` |
+| `listCategoriesWithCounts` | `()` | Same as above but with usage count per category (mapping-only categories show count 0) |
+| `setMerchantCategory` | `(merchant, category)` | Adds/updates a `merchant_mappings` row, then recategorizes existing Uncategorized expenses |
+| `renameCategory` | `(from, to)` | Bulk-updates `category` on both `expenses` and `merchant_mappings`; returns `{ updated }` (expense rows touched) |
+| `deleteCategory` | `(name)` | Sets matching `expenses.category` to `'Uncategorized'`; deletes matching `merchant_mappings` rows so those merchants resurface for recategorization; returns `{ reassigned }` |
+
+Preset vs. custom categories is a **frontend-only** concept (`frontend/src/lib/categories.ts`) — these backend functions operate on any category name.
 
 ### 4.11 `src/pipeline.js`
 
@@ -332,11 +357,18 @@ Base URL: `http://localhost:3000` (configurable via `PORT` env var)
 | POST | `/accounts/:id/backfill` | — | `{ balance, expensesLinked }` |
 | GET | `/expenses` | `?limit=50&offset=0&category=&accountLast4=` | `Array<expense>` |
 | GET | `/expenses/:id` | — | `expense` |
+| PATCH | `/expenses/:id` | `{ notes }` | `expense` (updated row) |
+| GET | `/categories` | — | `Array<string>` |
+| GET | `/categories/stats` | — | `Array<{ category, count }>` |
+| GET | `/merchants/uncategorized` | — | `Array<{ merchant, count, total }>` |
+| POST | `/merchant-mappings` | `{ merchant, category }` | `{ recategorized }` |
+| POST | `/categories/rename` | `{ from, to }` | `{ updated }` |
+| POST | `/categories/delete` | `{ name }` | `{ reassigned }` |
 | POST | `/sync` | — | `{ parsed, skipped, errors, recategorized }` or `409` |
 
 ---
 
-## 6. Database Tables (Supabase / PostgreSQL)
+## 6. Database Tables (PostgreSQL)
 
 Schema source of truth: `db/schema.sql`. Applied automatically on startup.
 
@@ -356,6 +388,7 @@ Schema source of truth: `db/schema.sql`. Applied automatically on startup.
 | `available_credit_limit` | NUMERIC(12,2) | nullable |
 | `account_type` | TEXT | credit_card / debit_card / upi / netbanking / bank_transfer |
 | `account_last4` | TEXT | Last 4 digits, nullable |
+| `notes` | TEXT | User-editable annotation, nullable. Set via `PATCH /expenses/:id`; never written by the sync pipeline, so it survives upserts on re-sync |
 | `created_at` | TIMESTAMPTZ | Auto-set |
 
 ### `processed_emails`
@@ -409,7 +442,7 @@ UNIQUE constraint on `(account_type, account_last4)`.
 | `expense_id` | BIGINT FK | → expenses.id (nullable) — idempotency key |
 | `created_at` | TIMESTAMPTZ | Indexed |
 
-### `update_account_balance` RPC
+### `update_account_balance` function
 ```sql
 update_account_balance(
   p_account_id  BIGINT,
@@ -437,10 +470,10 @@ Free tier: 15 RPM, 1M tokens/day — sufficient for personal use.
 3. Download JSON → save as `data/credentials.json`
 4. Run `npm run auth` once to generate `data/token.json`
 
-### 7.3 Supabase
-1. Sign up at supabase.com → New project (free tier)
-2. Project Settings → API → copy URL and anon key into `.env`
-3. (Optional) Set `DATABASE_URL` for schema bootstrap via `pg`
+### 7.3 PostgreSQL
+1. Install PostgreSQL locally and ensure the server is running
+2. Create a database: `createdb expense_tracker`
+3. Set `DATABASE_URL` in `.env` (required — used for all queries and schema bootstrap via `pg`)
 
 ### 7.4 Node.js Dependencies
 ```json
@@ -449,7 +482,6 @@ Free tier: 15 RPM, 1M tokens/day — sufficient for personal use.
     "express": "^4.x",
     "googleapis": "^171.x",
     "@google/genai": "^1.x",
-    "@supabase/supabase-js": "^2.x",
     "pg": "^8.x",
     "dotenv": "^16.x",
     "cheerio": "^1.x"
@@ -463,13 +495,13 @@ Free tier: 15 RPM, 1M tokens/day — sufficient for personal use.
 
 | Scenario | Behavior |
 |----------|----------|
-| `SUPABASE_URL` / `SUPABASE_ANON_KEY` missing | `db.js` throws at import — process exits before startup |
+| `DATABASE_URL` missing | `db.js` throws at import — process exits before startup |
 | Schema bootstrap fails | `runSync()` throws; server returns 500; script exits 1 |
 | `authorize()` fails | `runSync()` throws — token missing or unrefreshable; re-run `npm run auth` |
 | Gemini API error | Logged to `activity_logs` as ERROR; email **not** marked processed (retried next run) |
 | Gmail fetch error | Email marked processed immediately (no infinite retry); logged as ERROR |
 | Gmail label not found | Returns `null` ID → skips that label, continues with others |
-| Supabase insert fails | Throws; caught in pipeline → logged, email skipped |
+| Postgres insert fails | Throws; caught in pipeline → logged, email skipped |
 | `activity_logs` insert fails | Non-fatal — logged to stderr, run continues |
 | `/sync` called while running | Returns `409 { error: 'sync already in progress' }` |
 | Invalid `amount` on add-funds/pay | Returns `400 { error: 'amount must be a positive number' }` |

@@ -1,10 +1,47 @@
-const { createClient } = require('@supabase/supabase-js');
+const { Pool } = require('pg');
 const settings = require('../config/settings');
 
-if (!settings.supabaseUrl || !settings.supabaseAnonKey) {
-  throw new Error('SUPABASE_URL and SUPABASE_ANON_KEY must be set in .env');
+if (!settings.databaseUrl) {
+  throw new Error('DATABASE_URL must be set in .env (local Postgres connection)');
 }
 
-const supabase = createClient(settings.supabaseUrl, settings.supabaseAnonKey);
+// Local Postgres: no SSL.
+const pool = new Pool({ connectionString: settings.databaseUrl });
 
-module.exports = supabase;
+/**
+ * Run a query, return the rows array.
+ */
+async function query(text, params) {
+  const res = await pool.query(text, params);
+  return res.rows;
+}
+
+/**
+ * Run a query, return the first row or null.
+ * Use for 0-or-1-row queries.
+ */
+async function queryOne(text, params) {
+  const res = await pool.query(text, params);
+  return res.rows[0] ?? null;
+}
+
+/**
+ * Run fn(client) inside a transaction. Commits on success, rolls back on throw.
+ * fn receives a client with the same query/queryOne-shaped `.query()` from `pg`.
+ */
+async function withTransaction(fn) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+module.exports = { pool, query, queryOne, withTransaction };

@@ -28,6 +28,7 @@ export interface Expense {
   available_credit_limit: number | null
   account_type: string | null
   account_last4: string | null
+  notes: string | null
   created_at: string
 }
 
@@ -47,6 +48,12 @@ export interface SyncStats {
   skipped: number
   errors: number
   recategorized: number
+}
+
+export interface UncategorizedMerchant {
+  merchant: string
+  count: number
+  total: number
 }
 
 export interface CreateAccountPayload {

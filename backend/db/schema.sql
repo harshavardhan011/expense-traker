@@ -1,6 +1,6 @@
--- Single source of truth for all Supabase tables.
+-- Single source of truth for all database tables (local PostgreSQL).
 -- Every statement is idempotent (IF NOT EXISTS / OR REPLACE).
--- Applied automatically on `npm start` when DATABASE_URL is set.
+-- Applied automatically on server startup (bootstrapSchema in db-bootstrap.js) when DATABASE_URL is set.
 
 -- ─── expenses ────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS expenses (
@@ -17,8 +17,12 @@ CREATE TABLE IF NOT EXISTS expenses (
   available_credit_limit NUMERIC(12,2),
   account_type           TEXT,
   account_last4          TEXT,
+  notes                  TEXT,
   created_at             TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Migration: add notes column to pre-existing expenses tables (no-op on fresh DBs).
+ALTER TABLE expenses ADD COLUMN IF NOT EXISTS notes TEXT;
 
 -- ─── merchant_mappings ────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS merchant_mappings (
