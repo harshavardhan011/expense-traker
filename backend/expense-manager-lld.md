@@ -49,8 +49,14 @@ All persistent state lives in Supabase. Only OAuth credential files remain local
 [authorize()] ──► get Gmail auth client from token.json
         │
         ▼
-[Gmail API] ──► fetch email IDs from configured labels (last N hours)
+[pruneProcessedIds()] ──► DELETE processed_emails older than retention window
         │
+        ▼
+[getLastRunCutoff()] ──► newest processed_at − OVERLAP_BUFFER_MINUTES
+        │                 (falls back to now − FETCH_WINDOW_HOURS if table empty)
+        ▼
+[Gmail API] ──► fetch email IDs since cutoff — ONE combined messages.list query
+        │        across all configured labels (maxResults 100)
         ▼
 [Dedup Filter] ──► skip already-processed email IDs
         │            (SELECT from processed_emails table)
@@ -85,39 +91,48 @@ Returns stats object: { parsed, skipped, errors, recategorized }
 
 ## 3. Project Structure
 
+The repository is a two-workspace monorepo. This document covers `backend/`; the React dashboard in `frontend/` is documented in `frontend/README.md`.
+
 ```
-expense-manager/
-├── src/
-│   ├── index.js                    # Thin wrapper — calls runSync(), exits (npm start)
-│   ├── server.js                   # Express HTTP API server (npm run server)
-│   ├── pipeline.js                 # Core sync logic — exports runSync()
-│   ├── auth.js                     # Google OAuth2 authentication
-│   ├── config/
-│   │   └── settings.js             # All configuration in one place
-│   └── services/
-│       ├── db.js                   # Supabase client singleton
-│       ├── db-bootstrap.js         # Applies db/schema.sql via raw pg connection
-│       ├── db-writer.js            # Insert/upsert expenses into Supabase
-│       ├── db-merchant-mapper.js   # DB-backed merchant lookup + in-process cache
-│       ├── account-manager.js      # Account CRUD + balance operations (RPC)
-│       ├── expense-reader.js       # Read-only queries for expenses table
-│       ├── gmail-reader.js         # Gmail API integration
-│       ├── gemini-parser.js        # Gemini Flash API for parsing emails
-│       ├── csv-writer.js           # [DEPRECATED — replaced by db-writer.js]
-│       └── merchant-mapper.js      # [DEPRECATED — replaced by db-merchant-mapper.js]
-├── db/
-│   └── schema.sql                  # Single source of truth for all tables + RPC
-├── scripts/
-│   └── migrate-to-supabase.js      # One-time migration: CSV/JSON files → Supabase
-├── data/
-│   ├── credentials.json            # Google OAuth creds (user provides, never in DB)
-│   └── token.json                  # Auto-generated after first auth (never in DB)
-├── package.json
-├── .env
-├── .env.example
-├── .gitignore
-└── README.md
+expense-tracker/
+├── backend/
+│   ├── src/
+│   │   ├── index.js                    # Thin wrapper — calls runSync(), exits (npm start)
+│   │   ├── server.js                   # Express HTTP API server (npm run server)
+│   │   ├── pipeline.js                 # Core sync logic — exports runSync()
+│   │   ├── auth.js                     # Google OAuth2 authentication
+│   │   ├── cli.js                      # Interactive account CLI (npm run cli)
+│   │   ├── config/
+│   │   │   └── settings.js             # All configuration in one place
+│   │   └── services/
+│   │       ├── db.js                   # Supabase client singleton
+│   │       ├── db-bootstrap.js         # Applies db/schema.sql via raw pg connection
+│   │       ├── db-writer.js            # Insert/upsert expenses into Supabase
+│   │       ├── db-merchant-mapper.js   # DB-backed merchant lookup + in-process cache
+│   │       ├── account-manager.js      # Account CRUD + balance operations (RPC)
+│   │       ├── expense-reader.js       # Read-only queries for expenses table
+│   │       ├── gmail-reader.js         # Gmail API integration
+│   │       ├── gemini-parser.js        # Gemini Flash API for parsing emails
+│   │       ├── csv-writer.js           # [DEPRECATED — replaced by db-writer.js]
+│   │       └── merchant-mapper.js      # [DEPRECATED — replaced by db-merchant-mapper.js]
+│   ├── db/
+│   │   └── schema.sql                  # Single source of truth for all tables + RPC
+│   ├── scripts/
+│   │   ├── migrate-to-supabase.js      # One-time migration: CSV/JSON files → Supabase
+│   │   └── migration-accounts.sql      # One-time accounts/account_transactions migration
+│   ├── data/
+│   │   ├── credentials.json            # Google OAuth creds (user provides, never in DB)
+│   │   └── token.json                  # Auto-generated after first auth (never in DB)
+│   ├── package.json
+│   ├── .env
+│   ├── .env.example
+│   ├── .gitignore
+│   └── README.md
+└── frontend/                           # Vite + React 19 + TS dashboard (Tailwind v4)
+    └── src/                            # proxies /api → http://localhost:3000
 ```
+
+The two deprecated services are unreferenced dead code — nothing in the active pipeline requires them.
 
 ---
 
@@ -163,9 +178,13 @@ Handles Google OAuth2 for Gmail API (read-only scope).
 **`fetchEmailBody(auth, emailId)`** → `{ body, receivedAt, subject, labelIds }`
 **`resolveLabelName(msgLabelIds, labelIdToName, gmailLabels)`** → `string`
 
-- Resolves each label name → label ID at runtime via `users.labels.list`
+- Label names → IDs via a single `users.labels.list` call, cached in-process (`labelIdCache`) for the life of the process. An unresolved label logs a warning and is skipped — it never falls through to matching all messages
+- **One combined `messages.list` call** per run, capped at `maxResults: 100`:
+  - single label → `labelIds: [id]` filter plus `after:<seconds>`
+  - multiple labels → `after:<seconds> (label:"a" OR label:"b")`
 - `after:` query uses Unix seconds (divide `Date.now()` by 1000)
-- Body: walks MIME tree, prefers `text/plain`, falls back to `text/html`
+- Label attribution is deferred: `fetchEmailBody` returns the message's `labelIds`, and `resolveLabelName` maps them back to a configured name in `gmailLabels` order (first configured label wins)
+- Body: walks MIME tree, prefers `text/plain`; `text/html` is passed through cheerio (`stripHtml` removes `style`/`script` and collapses whitespace)
 - Gmail returns URL-safe base64 — decode with `-`→`+`, `_`→`/` before `Buffer.from`
 
 ### 4.4 `src/services/gemini-parser.js`
@@ -284,6 +303,8 @@ async function runSync() {
 ```
 
 State is saved **per-email** immediately after DB write — a crash mid-run won't cause duplicates on restart.
+
+`FETCH_WINDOW_HOURS` only applies at step 5 when `processed_emails` is empty; in steady state the cutoff comes from the last run. If `PROCESSED_EMAILS_RETENTION_HOURS < FETCH_WINDOW_HOURS`, dedup rows can be pruned before the fetch window closes — `runSync()` logs a `[WARN]` for this rather than failing.
 
 ### 4.12 `src/server.js`
 
@@ -464,12 +485,16 @@ Free tier: 15 RPM, 1M tokens/day — sufficient for personal use.
 | Scenario | Behavior |
 |----------|----------|
 | `SUPABASE_URL` / `SUPABASE_ANON_KEY` missing | `db.js` throws at import — process exits before startup |
-| Schema bootstrap fails | `runSync()` throws; server returns 500; script exits 1 |
+| `DATABASE_URL` missing | Non-fatal — `bootstrapSchema()` warns and skips schema sync; tables must already exist |
+| Schema bootstrap fails | `runSync()` throws; server returns 500; script exits 1. On server startup, exits 1 before `listen` |
 | `authorize()` fails | `runSync()` throws — token missing or unrefreshable; re-run `npm run auth` |
-| Gemini API error | Logged to `activity_logs` as ERROR; email **not** marked processed (retried next run) |
+| Expired token, refresh returns `invalid_grant` | `token.json` is deleted and the interactive OAuth flow restarts |
+| Gemini API error / non-JSON response | Every email in the batch gets `geminiError`; logged to `activity_logs` as ERROR; emails **not** marked processed (retried next run) |
 | Gmail fetch error | Email marked processed immediately (no infinite retry); logged as ERROR |
-| Gmail label not found | Returns `null` ID → skips that label, continues with others |
-| Supabase insert fails | Throws; caught in pipeline → logged, email skipped |
+| Gmail label not found | Warns and skips that label; if no label resolves, the run returns zero items |
+| Supabase expense insert fails | `insertExpense()` throws and is **not** caught in the pipeline loop — aborts the whole run (already-processed emails stay saved) |
+| Account balance update fails | Non-fatal — warned; the expense row is still written |
+| No account registered for an expense's last4 | Non-fatal — warned, balance not updated; run `account backfill` after adding the account |
 | `activity_logs` insert fails | Non-fatal — logged to stderr, run continues |
 | `/sync` called while running | Returns `409 { error: 'sync already in progress' }` |
 | Invalid `amount` on add-funds/pay | Returns `400 { error: 'amount must be a positive number' }` |
@@ -479,8 +504,16 @@ Free tier: 15 RPM, 1M tokens/day — sufficient for personal use.
 
 ## 9. Future Enhancements
 
-- **Full CLI → HTTP migration** — `src/cli.js` is a temporary parallel path; all account management will move to HTTP endpoints once a UI is connected.
-- **Frontend UI** — connect a React/Next.js dashboard to the REST API (`GET /expenses`, `GET /accounts`, `POST /sync`).
+**Done since the first draft:**
+
+- ~~**Frontend UI**~~ — a React 19 + Vite dashboard lives in `frontend/` and consumes `GET /expenses`, `GET /accounts`, `POST /sync`.
+- ~~**Incremental fetch window**~~ — the cutoff now resumes from the last processed email instead of always scanning `FETCH_WINDOW_HOURS` back.
+
+**Still open:**
+
+- **CLI retirement** — `src/cli.js` now duplicates functionality available over HTTP and in the dashboard. It is kept for terminal use; drop it once nothing depends on it.
+- **Gmail pagination** — a run is still capped at 100 messages because `nextPageToken` is ignored.
+- **Aggregate endpoints** — the Dashboard computes month-to-date and per-category totals client-side from `GET /expenses?limit=200`. A server-side aggregate would remove that ceiling.
 - **Scheduled sync** — add an internal `setInterval` in `server.js` to auto-run `runSync()` every N hours, or expose a cron endpoint.
 - **Auth middleware** — add an API key or JWT check to the Express routes before exposing the server externally.
 - **Pagination metadata** — return `{ data, total, offset, limit }` from `GET /expenses` for cursor-based UI pagination.

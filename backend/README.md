@@ -61,6 +61,8 @@ Server starts on `http://localhost:3000`.
 npm start
 ```
 
+To use the web dashboard, leave `npm run server` running and start the UI from `../frontend` (`npm run dev`) — its dev server proxies `/api` to this one on port 3000. See [`../frontend/README.md`](../frontend/README.md).
+
 ## Configuration (`.env`)
 
 | Variable | Default | Description |
@@ -70,9 +72,23 @@ npm start
 | `SUPABASE_ANON_KEY` | *(required)* | Supabase anon/public API key |
 | `DATABASE_URL` | *(optional)* | Postgres connection string — used only for schema bootstrap |
 | `GMAIL_LABELS` | `bank-alerts` | Comma-separated Gmail label names to scan |
-| `FETCH_WINDOW_HOURS` | `24` | How many hours back to scan |
+| `FETCH_WINDOW_HOURS` | `24` | Cold-start fallback window — used only when `processed_emails` is empty (see below) |
+| `OVERLAP_BUFFER_MINUTES` | `10` | Subtracted from the last-run cutoff to absorb clock skew and in-flight emails |
+| `PROCESSED_EMAILS_RETENTION_HOURS` | `FETCH_WINDOW_HOURS + 24` | How long dedup rows are kept; must be ≥ `FETCH_WINDOW_HOURS` |
 | `GEMINI_BATCH_SIZE` | `20` | Emails per Gemini API call |
 | `PORT` | `3000` | HTTP server port |
+
+### How the scan window is chosen
+
+Each run resumes from where the last one stopped rather than always scanning a fixed window:
+
+1. Rows in `processed_emails` older than `PROCESSED_EMAILS_RETENTION_HOURS` are pruned.
+2. The cutoff is the newest remaining `processed_at`, minus `OVERLAP_BUFFER_MINUTES`.
+3. If `processed_emails` is empty (first run, or after a truncate), the cutoff falls back to `now − FETCH_WINDOW_HOURS`.
+
+So a gap between runs is handled automatically — you do **not** need to widen `FETCH_WINDOW_HOURS` just because you run infrequently. Each run logs which source the cutoff came from.
+
+Keep retention above the fetch window. If `PROCESSED_EMAILS_RETENTION_HOURS < FETCH_WINDOW_HOURS`, dedup state can expire before the window closes and emails may be processed twice; the pipeline prints a `[WARN]` when it detects this.
 
 ## HTTP API
 
@@ -93,6 +109,9 @@ All routes return JSON. Errors return `{ "error": "message" }`.
 | POST | `/sync` | Trigger Gmail sync; returns `{ parsed, skipped, errors, recategorized }`. Returns 409 if already running. |
 
 ## Account Management (CLI)
+
+Everything here is also available over HTTP and in the web dashboard; the CLI is kept for terminal use.
+Commands take either the account's last 4 digits or its numeric ID — if a last4 matches more than one account, the CLI lists the matches and asks for the ID.
 
 ```bash
 npm run cli -- account list            # list all accounts with balances
@@ -133,10 +152,10 @@ Keys are lowercase; matching is case-insensitive.
 
 ## Useful Queries
 
-Monthly spending by category:
+Monthly spending by category (`expenses.date` is stored as `TEXT` in `YYYY-MM-DD` form):
 ```sql
 SELECT
-  TO_CHAR(date, 'YYYY-MM') AS month,
+  LEFT(date, 7) AS month,
   category,
   SUM(amount) AS total
 FROM expenses
@@ -154,9 +173,10 @@ ORDER BY account_type, name;
 
 ## Notes
 
-- Emails already in `processed_emails` are skipped on re-runs (no duplicates)
-- If `FETCH_WINDOW_HOURS=24` and you run weekly, emails older than 24h will be missed — increase the window accordingly
-- Pagination is not implemented; a maximum of 100 emails per label per run
+- Emails already in `processed_emails` are skipped on re-runs (no duplicates), and each email is marked processed immediately after its DB write — a crash mid-run won't duplicate rows on restart
+- Pagination is not implemented; all labels are fetched in one query capped at **100 emails per run**
+- Gemini failures leave the email unprocessed so it retries on the next run; Gmail fetch failures mark it processed immediately to avoid an infinite retry loop
 - `data/credentials.json` and `data/token.json` stay local — never stored in the database
-- **To re-process emails:** truncate the `processed_emails` table in Supabase and increase `FETCH_WINDOW_HOURS`
+- **To re-process emails:** truncate the `processed_emails` table in Supabase. That also drops the cutoff back to the `FETCH_WINDOW_HOURS` fallback, so raise it to cover the period you want re-scanned
 - `POST /sync` requires a pre-authorized `data/token.json` — run `npm run auth` before starting the server
+- The API has no authentication — keep it bound to localhost
