@@ -1,4 +1,4 @@
--- Single source of truth for all Supabase tables.
+-- Single source of truth for all PostgreSQL tables.
 -- Every statement is idempotent (IF NOT EXISTS / OR REPLACE).
 -- Applied automatically on `npm start` when DATABASE_URL is set.
 

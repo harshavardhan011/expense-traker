@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```
 expense-tracker/
-├── backend/    ← Node.js ≥22 Express API + Gmail→Gemini→Supabase pipeline
+├── backend/    ← Node.js ≥22 Express API + Gmail→Gemini→PostgreSQL pipeline
 │                 All backend npm commands run from here (cd backend first)
 └── frontend/   ← Vite + React 19 + TypeScript dashboard (Tailwind v4)
                   Dev server proxies /api → http://localhost:3000
@@ -22,7 +22,7 @@ Two independent npm workspaces — there is no root `package.json`. Install and 
 npm install          # install dependencies
 npm run auth         # one-time Gmail OAuth flow — creates data/token.json
 npm run server       # start the HTTP API server (default port 3000)
-npm start            # one-shot sync: fetch + parse emails → Supabase (script mode, kept for cron use)
+npm start            # one-shot sync: fetch + parse emails → local PostgreSQL (script mode, kept for cron use)
 npm run cli -- account list            # list all accounts with balances
 npm run cli -- account add             # add a new account (interactive)
 npm run cli -- account add-funds 1482  # add funds to savings/salary account
@@ -85,19 +85,19 @@ prune dedup state → compute cutoff → Gmail API (one combined query)
         ↓
 filter duplicates → fetch bodies (parallel) → Gemini batch
         ↓
-merchant map → Supabase (expenses) → account balance RPC → mark processed
+merchant map → Postgres (expenses) → account balance fn → mark processed
 ```
 
 **Data flow:**
 1. `auth.js` — OAuth2 Desktop App flow, `gmail.readonly` scope. Uses `getFreePort()` so the redirect URI port is truly ephemeral (the `oauthRedirectPort` setting is **not** used). Redirect URI must use `127.0.0.1` (not `localhost`) to avoid IPv6 mismatch on Windows. Token cached in `data/token.json`; auto-refreshed if expired. An `invalid_grant` refresh failure deletes the token and restarts the interactive flow. Consent times out after 2 minutes.
 2. `services/gmail-reader.js` — Resolves label names → IDs through a single `users.labels.list` call cached in-process for the life of the process; an unknown label logs a warning and is skipped (never falls through to "all messages"). Fetches IDs with **one combined `messages.list` query**: a single label uses the `labelIds` filter, multiple labels use `after:<s> (label:"a" OR label:"b")`. Gmail `after:` needs Unix **seconds** (divide `Date.now()` by 1000). Label attribution is deferred to `resolveLabelName()` at body-fetch time using the `labelIds` returned per message — first configured label wins. Body extracted by walking the MIME tree: prefers `text/plain`, falls back to `text/html` run through cheerio (`style`/`script` stripped, whitespace collapsed). Gmail returns URL-safe base64; decode with `-`→`+`, `_`→`/` before `Buffer.from`.
 3. `services/gemini-parser.js` — Uses `@google/genai` SDK (`GoogleGenAI`), model `gemini-2.5-flash`, `responseMimeType: 'application/json'`, `temperature: 0`. Emails are batched (`GEMINI_BATCH_SIZE`, default 20) into one prompt and each body is truncated to 1500 chars. Returns `null` expense for non-transaction emails; refunds/reversals/cashbacks are explicitly *not* treated as non-transactions. Uses Gmail `receivedAt` as the date fallback. API or JSON-parse failures return a `geminiError` for every email in the batch rather than throwing.
-4. `services/db-merchant-mapper.js` — Active merchant→category lookup via the Supabase `merchant_mappings` table, cached in-process. Keys are lowercased and trimmed; a `upi-id@bank Name` merchant is normalized down to `Name`. Auto-inserts `'Uncategorized'` for unknown merchants.
+4. `services/db-merchant-mapper.js` — Active merchant→category lookup via the `merchant_mappings` table, cached in-process. Keys are lowercased and trimmed; a `upi-id@bank Name` merchant is normalized down to `Name`. Auto-inserts `'Uncategorized'` for unknown merchants.
 5. `services/db-writer.js` — `insertExpense()` upserts on `email_id` (safe to re-run), then calls `recordExpenseImpact()` to update the linked account balance — a balance failure is warned, not fatal. `recategorizeUncategorized()` re-checks every `Uncategorized` expense against current mappings and returns the number updated.
-6. `services/account-manager.js` — Account CRUD, balance updates, and expense-to-account linking. Uses the `update_account_balance` Postgres RPC for atomic balance mutations. Finds accounts by `(account_type, account_last4)` with a last4-only fallback for UPI/netbanking expenses linking to savings accounts — the fallback only resolves when exactly one active account matches.
+6. `services/account-manager.js` — Account CRUD, balance updates, and expense-to-account linking. Uses the `update_account_balance` Postgres SQL function for atomic balance mutations. Finds accounts by `(account_type, account_last4)` with a last4-only fallback for UPI/netbanking expenses linking to savings accounts — the fallback only resolves when exactly one active account matches.
 7. `services/expense-reader.js` — Read-only queries for the `expenses` table (`listExpenses`, `getExpenseById`). Used by the HTTP server.
-8. `services/db-bootstrap.js` — Applies `db/schema.sql` in one transaction over a raw `pg` connection. Skipped with a warning when `DATABASE_URL` is unset.
-9. `services/db.js` — Supabase client singleton; **throws at import** if `SUPABASE_URL`/`SUPABASE_ANON_KEY` are missing.
+8. `services/db-bootstrap.js` — Applies `db/schema.sql` in one transaction over a raw `pg` connection on every startup.
+9. `services/db.js` — `pg` connection pool singleton; **throws at import** if `DATABASE_URL` is missing.
 10. `src/pipeline.js` — Core sync logic. State saved **per-email** immediately after the DB write (not at end of run), so a crash mid-run doesn't cause duplicates on restart. Returns `{ parsed, skipped, errors, recategorized }`; throws on fatal errors instead of `process.exit`.
 11. `src/index.js` — Thin wrapper: calls `runSync()` and exits. Preserves `npm start` behaviour.
 12. `src/cli.js` — Interactive CLI for account management (list, add, add-funds, pay, history, backfill). Uses Node.js `readline`. Superseded by the HTTP endpoints and the frontend, but still supported.
@@ -142,9 +142,7 @@ Key `.env` variables (see `backend/.env.example` for structure):
 | Variable | Default | Description |
 |---|---|---|
 | `GEMINI_API_KEY` | *(required)* | Gemini API key |
-| `SUPABASE_URL` | *(required)* | Supabase project URL |
-| `SUPABASE_ANON_KEY` | *(required)* | Supabase anon/public API key |
-| `DATABASE_URL` | *(optional)* | Postgres connection string — used only for schema bootstrap |
+| `DATABASE_URL` | *(required)* | Local PostgreSQL connection string |
 | `GMAIL_LABELS` | `bank-alerts` | Comma-separated Gmail label names to scan |
 | `GMAIL_LABEL` | — | Legacy alias for `GMAIL_LABELS` (single label) |
 | `FETCH_WINDOW_HOURS` | `24` | Cold-start fallback window, used only when `processed_emails` is empty |
@@ -166,13 +164,11 @@ The frontend needs no env vars — the API base is the fixed path `/api`, resolv
 | `processed-emails.json` | Legacy dedup state (superseded by `processed_emails` table) |
 | `activity.log` | Legacy file log (superseded by `activity_logs` table) |
 
-`backend/scripts/migrate-to-supabase.js` is the one-time importer that moved those legacy files into Supabase.
+**To re-process emails:** truncate the `processed_emails` table. That also resets the cutoff to the `FETCH_WINDOW_HOURS` fallback, so raise it to cover the period you want to re-scan.
 
-**To re-process emails:** truncate the `processed_emails` Supabase table. That also resets the cutoff to the `FETCH_WINDOW_HOURS` fallback, so raise it to cover the period you want to re-scan.
+## Database Tables
 
-## Supabase Tables
-
-Schema defined in `backend/db/schema.sql` (single source of truth). All tables and the `update_account_balance` RPC are created automatically on startup via `CREATE TABLE IF NOT EXISTS` / `CREATE OR REPLACE FUNCTION` — idempotent, safe to run every time. Bootstrap is skipped (with a warning) when `DATABASE_URL` is unset.
+Schema defined in `backend/db/schema.sql` (single source of truth). All tables and the `update_account_balance` function are created automatically on every startup via `CREATE TABLE IF NOT EXISTS` / `CREATE OR REPLACE FUNCTION` — idempotent, safe to run every time.
 
 | Table | Purpose |
 |-------|---------|
@@ -189,7 +185,7 @@ Schema defined in `backend/db/schema.sql` (single source of truth). All tables a
 - Account types are constrained to `credit_card`, `savings`, `salary`, `debit_card`; `accounts` is unique on `(account_type, account_last4)`.
 - Linking: expenses match accounts by `(account_type, account_last4)` with last4-only fallback.
 - Idempotent: `account_transactions.expense_id` prevents double-counting on re-runs.
-- Atomic: the `update_account_balance` RPC handles UPDATE + INSERT in one transaction and returns the new balance.
+- Atomic: the `update_account_balance` SQL function handles UPDATE + INSERT in one transaction and returns the new balance.
 
 ## Key Design Constraints
 
@@ -206,7 +202,7 @@ These files contain live credentials and secrets. Never read, grep, or glob them
 
 | File | Contains |
 |------|----------|
-| `backend/.env`, `backend/.env.*` | `GEMINI_API_KEY`, Supabase keys, and `DATABASE_URL` |
+| `backend/.env`, `backend/.env.*` | `GEMINI_API_KEY` and `DATABASE_URL` |
 | `backend/data/credentials.json` | Google OAuth2 client secret |
 | `backend/data/token.json` | Live OAuth access + refresh tokens |
 | `*.pem`, `*.key`, `*.p12`, `*.pfx` | Private keys / certificates |

@@ -1,10 +1,16 @@
-const { createClient } = require('@supabase/supabase-js');
+const { Pool } = require('pg');
 const settings = require('../config/settings');
 
-if (!settings.supabaseUrl || !settings.supabaseAnonKey) {
-  throw new Error('SUPABASE_URL and SUPABASE_ANON_KEY must be set in .env');
+if (!settings.databaseUrl) {
+  throw new Error('DATABASE_URL must be set in .env');
 }
 
-const supabase = createClient(settings.supabaseUrl, settings.supabaseAnonKey);
+const { hostname } = new URL(settings.databaseUrl);
+const isLocal = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
 
-module.exports = supabase;
+const pool = new Pool({
+  connectionString: settings.databaseUrl,
+  ...(isLocal ? {} : { ssl: { rejectUnauthorized: false } }),
+});
+
+module.exports = pool;

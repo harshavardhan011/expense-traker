@@ -13,7 +13,12 @@ async function bootstrapSchema() {
   }
 
   const sql = fs.readFileSync(path.join(__dirname, '../../db/schema.sql'), 'utf8');
-  const client = new Client({ connectionString: url, ssl: { rejectUnauthorized: false } });
+  const { hostname } = new URL(url);
+  const isLocal = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
+  const client = new Client({
+    connectionString: url,
+    ...(isLocal ? {} : { ssl: { rejectUnauthorized: false } }),
+  });
   await client.connect();
   try {
     await client.query('BEGIN');

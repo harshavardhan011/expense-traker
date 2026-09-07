@@ -54,7 +54,6 @@ module.exports = {
   // Log file for skipped and errored emails
   activityLogPath: path.join(DATA_DIR, 'activity.log'),
 
-  // Supabase
-  supabaseUrl: process.env.SUPABASE_URL || '',
-  supabaseAnonKey: process.env.SUPABASE_ANON_KEY || '',
+  // PostgreSQL
+  databaseUrl: process.env.DATABASE_URL || '',
 };

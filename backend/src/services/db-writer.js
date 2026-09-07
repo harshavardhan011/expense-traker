@@ -1,4 +1,4 @@
-const supabase = require('./db');
+const pool = require('./db');
 const { recordExpenseImpact } = require('./account-manager');
 
 /**
@@ -7,28 +7,48 @@ const { recordExpenseImpact } = require('./account-manager');
  * After upsert, updates the linked account balance (if any).
  */
 async function insertExpense(row) {
-  const { data, error } = await supabase.from('expenses').upsert(
-    {
-      email_id: row.emailId,
-      label: row.label,
-      date: row.date,
-      amount: row.amount,
-      currency: row.currency,
-      type: row.type,
-      merchant: row.merchant,
-      category: row.category,
-      raw_description: row.rawDescription,
-      available_credit_limit: row.availableCreditLimit ?? null,
-      account_type: row.accountType ?? null,
-      account_last4: row.accountLast4 ?? null,
-    },
-    { onConflict: 'email_id' }
-  ).select('id').single();
-  if (error) throw new Error(`insertExpense failed: ${error.message}`);
+  let result;
+  try {
+    result = await pool.query(
+      `INSERT INTO expenses (
+         email_id, label, date, amount, currency, type, merchant, category,
+         raw_description, available_credit_limit, account_type, account_last4
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       ON CONFLICT (email_id) DO UPDATE SET
+         label = EXCLUDED.label,
+         date = EXCLUDED.date,
+         amount = EXCLUDED.amount,
+         currency = EXCLUDED.currency,
+         type = EXCLUDED.type,
+         merchant = EXCLUDED.merchant,
+         category = EXCLUDED.category,
+         raw_description = EXCLUDED.raw_description,
+         available_credit_limit = EXCLUDED.available_credit_limit,
+         account_type = EXCLUDED.account_type,
+         account_last4 = EXCLUDED.account_last4
+       RETURNING id`,
+      [
+        row.emailId,
+        row.label,
+        row.date,
+        row.amount,
+        row.currency,
+        row.type,
+        row.merchant,
+        row.category,
+        row.rawDescription,
+        row.availableCreditLimit ?? null,
+        row.accountType ?? null,
+        row.accountLast4 ?? null,
+      ]
+    );
+  } catch (err) {
+    throw new Error(`insertExpense failed: ${err.message}`);
+  }
 
   // Update linked account balance (non-blocking — warns if no account found)
   try {
-    await recordExpenseImpact(row, data.id);
+    await recordExpenseImpact(row, result.rows[0].id);
   } catch (err) {
     console.warn(`[insertExpense] account balance update failed (non-fatal): ${err.message}`);
   }
@@ -41,21 +61,28 @@ async function insertExpense(row) {
  */
 async function recategorizeUncategorized() {
   // Fetch all uncategorized expenses
-  const { data: rows, error: fetchErr } = await supabase
-    .from('expenses')
-    .select('id, merchant')
-    .eq('category', 'Uncategorized');
+  let rows;
+  try {
+    const result = await pool.query(
+      `SELECT id, merchant FROM expenses WHERE category = 'Uncategorized'`
+    );
+    rows = result.rows;
+  } catch (err) {
+    throw new Error(`recategorize fetch failed: ${err.message}`);
+  }
 
-  if (fetchErr) throw new Error(`recategorize fetch failed: ${fetchErr.message}`);
   if (!rows || rows.length === 0) return 0;
 
   // Fetch all current mappings in one go
-  const { data: mappings, error: mapErr } = await supabase
-    .from('merchant_mappings')
-    .select('merchant, category')
-    .neq('category', 'Uncategorized');
-
-  if (mapErr) throw new Error(`recategorize mappings fetch failed: ${mapErr.message}`);
+  let mappings;
+  try {
+    const result = await pool.query(
+      `SELECT merchant, category FROM merchant_mappings WHERE category != 'Uncategorized'`
+    );
+    mappings = result.rows;
+  } catch (err) {
+    throw new Error(`recategorize mappings fetch failed: ${err.message}`);
+  }
 
   const map = new Map((mappings || []).map(m => [m.merchant, m.category]));
 
@@ -64,11 +91,11 @@ async function recategorizeUncategorized() {
     const key = (row.merchant || '').toLowerCase().trim();
     const newCategory = map.get(key);
     if (newCategory) {
-      const { error: updateErr } = await supabase
-        .from('expenses')
-        .update({ category: newCategory })
-        .eq('id', row.id);
-      if (updateErr) throw new Error(`recategorize update failed: ${updateErr.message}`);
+      try {
+        await pool.query('UPDATE expenses SET category = $1 WHERE id = $2', [newCategory, row.id]);
+      } catch (err) {
+        throw new Error(`recategorize update failed: ${err.message}`);
+      }
       count++;
     }
   }

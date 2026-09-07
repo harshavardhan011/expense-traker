@@ -1,13 +1,13 @@
 # Expense Manager
 
-Reads Gmail bank alert emails, parses transactions with Gemini, categorizes merchants, and stores everything to Supabase (PostgreSQL). Exposes a REST API so any UI can connect.
+Reads Gmail bank alert emails, parses transactions with Gemini, categorizes merchants, and stores everything to PostgreSQL. Exposes a REST API so any UI can connect.
 
 ## Prerequisites
 
 - Node.js 22 LTS
 - Google Cloud project with Gmail API enabled
 - Gemini API key
-- Supabase account (free at supabase.com)
+- A local PostgreSQL instance
 
 ## Setup
 
@@ -22,14 +22,13 @@ cp .env.example .env
 ```
 Edit `.env` and fill in all required values.
 
-### 3. Set up Supabase
+### 3. Set up PostgreSQL
 
-1. Sign up at [supabase.com](https://supabase.com) → create a new project (free, no credit card)
-2. Go to **Project Settings → API** and copy:
-   - **Project URL** → paste as `SUPABASE_URL` in `.env`
-   - **anon/public key** → paste as `SUPABASE_ANON_KEY` in `.env`
+1. Make sure your local PostgreSQL server is running
+2. Create a database: `createdb expense_tracker`
+3. Set `DATABASE_URL` in `.env`, e.g. `postgresql://postgres:<password>@localhost:5432/expense_tracker`
 
-> All tables and the `update_account_balance` RPC are created automatically on first run via `db/schema.sql`. No manual SQL needed.
+> All tables and the `update_account_balance` function are created automatically on first run via `db/schema.sql`. No manual SQL needed.
 
 ### 4. Configure Gmail OAuth credentials
 
@@ -68,9 +67,7 @@ To use the web dashboard, leave `npm run server` running and start the UI from `
 | Variable | Default | Description |
 |---|---|---|
 | `GEMINI_API_KEY` | *(required)* | Your Gemini API key |
-| `SUPABASE_URL` | *(required)* | Supabase project URL |
-| `SUPABASE_ANON_KEY` | *(required)* | Supabase anon/public API key |
-| `DATABASE_URL` | *(optional)* | Postgres connection string — used only for schema bootstrap |
+| `DATABASE_URL` | *(required)* | Local PostgreSQL connection string |
 | `GMAIL_LABELS` | `bank-alerts` | Comma-separated Gmail label names to scan |
 | `FETCH_WINDOW_HOURS` | `24` | Cold-start fallback window — used only when `processed_emails` is empty (see below) |
 | `OVERLAP_BUFFER_MINUTES` | `10` | Subtracted from the last-run cutoff to absorb clock skew and in-flight emails |
@@ -122,7 +119,7 @@ npm run cli -- account history 8735    # show transaction history
 npm run cli -- account backfill 8735   # recalculate balance from existing expenses
 ```
 
-## Supabase Tables
+## Database Tables
 
 | Table | Purpose |
 |-------|---------|
@@ -140,7 +137,7 @@ npm run cli -- account backfill 8735   # recalculate balance from existing expen
 
 ## Merchant Categories
 
-Update merchant→category mappings directly in the Supabase `merchant_mappings` table, or via SQL:
+Update merchant→category mappings directly in the `merchant_mappings` table, or via SQL:
 
 ```sql
 INSERT INTO merchant_mappings (merchant, category)
@@ -177,6 +174,6 @@ ORDER BY account_type, name;
 - Pagination is not implemented; all labels are fetched in one query capped at **100 emails per run**
 - Gemini failures leave the email unprocessed so it retries on the next run; Gmail fetch failures mark it processed immediately to avoid an infinite retry loop
 - `data/credentials.json` and `data/token.json` stay local — never stored in the database
-- **To re-process emails:** truncate the `processed_emails` table in Supabase. That also drops the cutoff back to the `FETCH_WINDOW_HOURS` fallback, so raise it to cover the period you want re-scanned
+- **To re-process emails:** truncate the `processed_emails` table. That also drops the cutoff back to the `FETCH_WINDOW_HOURS` fallback, so raise it to cover the period you want re-scanned
 - `POST /sync` requires a pre-authorized `data/token.json` — run `npm run auth` before starting the server
 - The API has no authentication — keep it bound to localhost

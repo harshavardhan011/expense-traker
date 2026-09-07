@@ -2,14 +2,14 @@
 
 ## 1. Overview
 
-A Node.js application that reads bank payment alert emails from Gmail, parses them using Google Gemini Flash API, auto-categorizes using a merchant mapping table in Supabase, and stores all expense and account data to PostgreSQL (Supabase).
+A Node.js application that reads bank payment alert emails from Gmail, parses them using Google Gemini Flash API, auto-categorizes using a merchant mapping table, and stores all expense and account data to PostgreSQL.
 
 The app has two entry points that share the same core pipeline:
 
 - **`src/server.js`** — Express HTTP API server (primary). Exposes REST endpoints so any UI can connect. Runs persistently with `npm run server`.
 - **`src/index.js`** — One-shot script wrapper (kept for cron/manual use). Calls `runSync()` and exits. Runs with `npm start`.
 
-All persistent state lives in Supabase. Only OAuth credential files remain local.
+All persistent state lives in PostgreSQL. Only OAuth credential files remain local.
 
 ---
 
@@ -76,7 +76,7 @@ All persistent state lives in Supabase. Only OAuth credential files remain local
         ▼
 [Account Manager] ──► recordExpenseImpact()
         │               find matching account by (type, last4)
-        │               call update_account_balance RPC (atomic)
+        │               call update_account_balance SQL function (atomic)
         ▼
 [Save State] ──► INSERT email_id into processed_emails (per-email, not end-of-run)
         │
@@ -105,21 +105,18 @@ expense-tracker/
 │   │   ├── config/
 │   │   │   └── settings.js             # All configuration in one place
 │   │   └── services/
-│   │       ├── db.js                   # Supabase client singleton
+│   │       ├── db.js                   # pg connection pool singleton
 │   │       ├── db-bootstrap.js         # Applies db/schema.sql via raw pg connection
-│   │       ├── db-writer.js            # Insert/upsert expenses into Supabase
+│   │       ├── db-writer.js            # Insert/upsert expenses into PostgreSQL
 │   │       ├── db-merchant-mapper.js   # DB-backed merchant lookup + in-process cache
-│   │       ├── account-manager.js      # Account CRUD + balance operations (RPC)
+│   │       ├── account-manager.js      # Account CRUD + balance operations (SQL function)
 │   │       ├── expense-reader.js       # Read-only queries for expenses table
 │   │       ├── gmail-reader.js         # Gmail API integration
 │   │       ├── gemini-parser.js        # Gemini Flash API for parsing emails
 │   │       ├── csv-writer.js           # [DEPRECATED — replaced by db-writer.js]
 │   │       └── merchant-mapper.js      # [DEPRECATED — replaced by db-merchant-mapper.js]
 │   ├── db/
-│   │   └── schema.sql                  # Single source of truth for all tables + RPC
-│   ├── scripts/
-│   │   ├── migrate-to-supabase.js      # One-time migration: CSV/JSON files → Supabase
-│   │   └── migration-accounts.sql      # One-time accounts/account_transactions migration
+│   │   └── schema.sql                  # Single source of truth for all tables + SQL function
 │   ├── data/
 │   │   ├── credentials.json            # Google OAuth creds (user provides, never in DB)
 │   │   └── token.json                  # Auto-generated after first auth (never in DB)
@@ -151,8 +148,7 @@ module.exports = {
   geminiApiKey: process.env.GEMINI_API_KEY,
   geminiModel: 'gemini-2.5-flash',
   geminiBatchSize: 20,
-  supabaseUrl: process.env.SUPABASE_URL,
-  supabaseAnonKey: process.env.SUPABASE_ANON_KEY,
+  databaseUrl: process.env.DATABASE_URL,
   dataDir: './data',
   credentialsPath: './data/credentials.json',
   tokenPath: './data/token.json',
@@ -210,15 +206,15 @@ Sends emails in batches to Gemini Flash (`gemini-2.5-flash`), `responseMimeType:
 
 ### 4.5 `src/services/db.js`
 
-Supabase client singleton shared by all services:
+`pg` connection pool singleton shared by all services:
 
 ```javascript
-const { createClient } = require('@supabase/supabase-js');
-const supabase = createClient(settings.supabaseUrl, settings.supabaseAnonKey);
-module.exports = supabase;
+const { Pool } = require('pg');
+const pool = new Pool({ connectionString: settings.databaseUrl, ... });
+module.exports = pool;
 ```
 
-Throws at import time if `SUPABASE_URL` / `SUPABASE_ANON_KEY` are missing.
+Throws at import time if `DATABASE_URL` is missing. Skips TLS for `localhost`/`127.0.0.1`/`::1`, uses `ssl: { rejectUnauthorized: false }` for a remote host.
 
 ### 4.6 `src/services/db-bootstrap.js`
 
@@ -256,17 +252,17 @@ Account CRUD and balance management. All functions return data or throw — no `
 | `findAccount` | `(accountType, accountLast4)` | Exact match; falls back to last4-only for savings/UPI linking |
 | `getAccountById` | `(id)` | SELECT by PK |
 | `resolveAccount` | `(identifier)` | By ID (>9999) or last4; returns array (ambiguity-safe) |
-| `recordExpenseImpact` | `(expenseRow, expenseId)` | Links expense to account; calls `update_account_balance` RPC |
-| `addFunds` | `(accountId, amount, description)` | RPC `manual_credit` delta |
-| `recordPayment` | `(accountId, amount, description)` | RPC `payment` negative delta |
+| `recordExpenseImpact` | `(expenseRow, expenseId)` | Links expense to account; calls `update_account_balance` SQL function |
+| `addFunds` | `(accountId, amount, description)` | `manual_credit` delta |
+| `recordPayment` | `(accountId, amount, description)` | `payment` negative delta |
 | `getAccountTransactions` | `(accountId, limit=20)` | SELECT from account_transactions, newest first |
-| `backfillAccountBalance` | `(accountId)` | Re-run all linked expenses through the RPC; returns `{ balance, expensesLinked }` |
+| `backfillAccountBalance` | `(accountId)` | Re-run all linked expenses through the SQL function; returns `{ balance, expensesLinked }` |
 
 **Balance semantics:**
 - Credit card: DR → +delta (owe more), CR/payment → −delta (owe less)
 - Savings/salary: DR → −delta (funds leave), CR/manual_credit → +delta (funds arrive)
 
-**`update_account_balance` RPC** — atomically updates `accounts.balance += p_delta` and inserts an `account_transactions` row; returns new balance.
+**`update_account_balance` SQL function** — atomically updates `accounts.balance += p_delta` and inserts an `account_transactions` row; returns new balance.
 
 ### 4.10 `src/services/expense-reader.js`
 
@@ -357,7 +353,7 @@ Base URL: `http://localhost:3000` (configurable via `PORT` env var)
 
 ---
 
-## 6. Database Tables (Supabase / PostgreSQL)
+## 6. Database Tables (PostgreSQL)
 
 Schema source of truth: `db/schema.sql`. Applied automatically on startup.
 
@@ -430,7 +426,7 @@ UNIQUE constraint on `(account_type, account_last4)`.
 | `expense_id` | BIGINT FK | → expenses.id (nullable) — idempotency key |
 | `created_at` | TIMESTAMPTZ | Indexed |
 
-### `update_account_balance` RPC
+### `update_account_balance` SQL function
 ```sql
 update_account_balance(
   p_account_id  BIGINT,
@@ -458,10 +454,10 @@ Free tier: 15 RPM, 1M tokens/day — sufficient for personal use.
 3. Download JSON → save as `data/credentials.json`
 4. Run `npm run auth` once to generate `data/token.json`
 
-### 7.3 Supabase
-1. Sign up at supabase.com → New project (free tier)
-2. Project Settings → API → copy URL and anon key into `.env`
-3. (Optional) Set `DATABASE_URL` for schema bootstrap via `pg`
+### 7.3 PostgreSQL
+1. Install and start a local PostgreSQL server
+2. Create a database: `createdb expense_tracker`
+3. Set `DATABASE_URL` in `.env`, e.g. `postgresql://postgres:<password>@localhost:5432/expense_tracker`
 
 ### 7.4 Node.js Dependencies
 ```json
@@ -470,7 +466,6 @@ Free tier: 15 RPM, 1M tokens/day — sufficient for personal use.
     "express": "^4.x",
     "googleapis": "^171.x",
     "@google/genai": "^1.x",
-    "@supabase/supabase-js": "^2.x",
     "pg": "^8.x",
     "dotenv": "^16.x",
     "cheerio": "^1.x"
@@ -484,15 +479,14 @@ Free tier: 15 RPM, 1M tokens/day — sufficient for personal use.
 
 | Scenario | Behavior |
 |----------|----------|
-| `SUPABASE_URL` / `SUPABASE_ANON_KEY` missing | `db.js` throws at import — process exits before startup |
-| `DATABASE_URL` missing | Non-fatal — `bootstrapSchema()` warns and skips schema sync; tables must already exist |
+| `DATABASE_URL` missing | `db.js` throws at import — process exits before startup |
 | Schema bootstrap fails | `runSync()` throws; server returns 500; script exits 1. On server startup, exits 1 before `listen` |
 | `authorize()` fails | `runSync()` throws — token missing or unrefreshable; re-run `npm run auth` |
 | Expired token, refresh returns `invalid_grant` | `token.json` is deleted and the interactive OAuth flow restarts |
 | Gemini API error / non-JSON response | Every email in the batch gets `geminiError`; logged to `activity_logs` as ERROR; emails **not** marked processed (retried next run) |
 | Gmail fetch error | Email marked processed immediately (no infinite retry); logged as ERROR |
 | Gmail label not found | Warns and skips that label; if no label resolves, the run returns zero items |
-| Supabase expense insert fails | `insertExpense()` throws and is **not** caught in the pipeline loop — aborts the whole run (already-processed emails stay saved) |
+| Expense insert fails | `insertExpense()` throws and is **not** caught in the pipeline loop — aborts the whole run (already-processed emails stay saved) |
 | Account balance update fails | Non-fatal — warned; the expense row is still written |
 | No account registered for an expense's last4 | Non-fatal — warned, balance not updated; run `account backfill` after adding the account |
 | `activity_logs` insert fails | Non-fatal — logged to stderr, run continues |

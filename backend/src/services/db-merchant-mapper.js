@@ -1,4 +1,4 @@
-const supabase = require('./db');
+const pool = require('./db');
 
 // In-process cache — same pattern as the file-based merchant-mapper.js
 let cache = null;
@@ -11,9 +11,13 @@ function normalizeUpiMerchant(name) {
 
 async function loadCache() {
   if (cache) return cache;
-  const { data, error } = await supabase.from('merchant_mappings').select('merchant, category');
-  if (error) throw new Error(`merchant cache load failed: ${error.message}`);
-  cache = new Map((data || []).map(r => [r.merchant, r.category]));
+  let result;
+  try {
+    result = await pool.query('SELECT merchant, category FROM merchant_mappings');
+  } catch (err) {
+    throw new Error(`merchant cache load failed: ${err.message}`);
+  }
+  cache = new Map(result.rows.map(r => [r.merchant, r.category]));
   return cache;
 }
 
@@ -34,10 +38,15 @@ async function getCategory(merchantName) {
  */
 async function addMapping(merchantName, category) {
   const key = normalizeUpiMerchant((merchantName || '').toLowerCase().trim());
-  const { error } = await supabase
-    .from('merchant_mappings')
-    .upsert({ merchant: key, category }, { onConflict: 'merchant' });
-  if (error) throw new Error(`addMapping failed: ${error.message}`);
+  try {
+    await pool.query(
+      `INSERT INTO merchant_mappings (merchant, category) VALUES ($1, $2)
+       ON CONFLICT (merchant) DO UPDATE SET category = EXCLUDED.category`,
+      [key, category]
+    );
+  } catch (err) {
+    throw new Error(`addMapping failed: ${err.message}`);
+  }
   // Update local cache
   if (cache) cache.set(key, category);
 }
